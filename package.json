@@ -1,0 +1,33 @@
+{
+  "name": "clmm-ranger",
+  "version": "1.0.0",
+  "description": "Automated Raydium CLMM position re-ranger with Ledger signing",
+  "license": "GPL-3.0-only",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "ts-node src/index.ts",
+    "build": "tsc"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR_USERNAME/clmm-ranger.git"
+  },
+  "dependencies": {
+    "@ledgerhq/hw-app-solana": "^7.9.1",
+    "@ledgerhq/hw-transport-node-hid": "^6.32.1",
+    "@raydium-io/raydium-sdk-v2": "0.1.75-alpha",
+    "@solana/spl-token": "^0.4.8",
+    "@solana/web3.js": "^1.95.2",
+    "axios": "^1.7.2",
+    "bn.js": "^5.2.1",
+    "bs58": "^6.0.0",
+    "decimal.js": "^10.4.3",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.5",
+    "@types/node": "^20.12.7",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.3"
+  }
+}
