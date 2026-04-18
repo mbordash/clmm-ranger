@@ -52,11 +52,27 @@ The bot will:
 
 ## How It Works
 
-- Uses the **Raydium SDK v2** for CLMM position management
+- Uses the **Raydium SDK v2** for pool state reads, tick math, and base transaction building
 - Uses the **Jupiter Swap API** for token rebalancing
-- Computes the mathematically optimal token ratio using the concentrated-liquidity formula
+- Computes the mathematically optimal token ratio using the concentrated-liquidity formula (Q64 sqrtPrice math with 80-digit Decimal.js precision)
 - Iteratively swaps until the residual imbalance is below the configured threshold
-- Includes workarounds for Raydium SDK bugs (reward account derivation, Token-2022 NFT ATA patching)
+- All transactions use `TxVersion.LEGACY` for Ledger compatibility (Ledger cannot sign V0/versioned transactions)
+
+## Raydium SDK Workarounds
+
+This bot uses the Raydium SDK selectively. The SDK is helpful for **reading pool state** (`getPoolInfoFromRpc`, `getOwnerPositionInfo`) and **tick math** (`TickUtils.getTickPrice`), but its transaction building has several issues that required manual patching:
+
+| Issue | SDK Bug | Our Fix |
+|---|---|---|
+| **Versioned transactions** | SDK defaults to `TxVersion.V0` which Ledger can't sign | Force `TxVersion.LEGACY` on all calls |
+| **Missing NFT signer** | `openPositionFromBase` returns `{ transaction, signers }` but the SDK's own `execute()` is the only path that applies the ephemeral NFT mint keypair signature | Destructure `signers`, call `tx.sign(...signers)` before Ledger signs |
+| **Empty reward accounts** | `clmmComputeInfoToApiInfo()` hardcodes `rewardDefaultInfos: []`, causing `InvalidRewardInputAccountNumber` (6035) on pools with rewards | Populate from `poolKeys.rewardInfos` manually |
+| **Wrong NFT ATA** | SDK hardcodes `TOKEN_PROGRAM_ID` when deriving the position NFT's ATA; fails for Token-2022 NFTs | Detect actual token program, patch instruction account keys |
+| **Stale token cache** | After Jupiter swaps, the SDK's cached token accounts are stale | Call `fetchWalletTokenAccounts()` before building deposit tx |
+| **poolKeys not passed** | `openPositionFromBase` re-fetches pool keys via API if not provided, which can fail | Capture from `getPoolInfoFromRpc` and pass directly |
+| **Q64 precision overflow** | Default Decimal.js precision (20 digits) is insufficient for sqrtPriceX64 math (~57 digits needed) | Set `Decimal.precision = 80` |
+
+If you're building your own CLMM bot, we recommend using the SDK only for reads and math, then handling transaction construction, signing, and submission yourself.
 
 ## ⚠️ Disclaimer
 
