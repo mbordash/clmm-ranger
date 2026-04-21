@@ -408,6 +408,157 @@ async function rebalanceAndDeposit(
     } catch (err: any) { console.error('Deposit Error:', err); }
 }
 
+/**
+ * Top up an existing position with undeposited dust by rebalancing and calling increaseLiquidity.
+ * Much cheaper than re-ranging (no NFT burn/mint, no position PDA recreation).
+ */
+async function topUpPosition(
+    position: any,
+    poolInfo: ApiV3PoolInfoConcentratedItem,
+    poolKeys: any
+) {
+    try {
+        const tickLower = position.tickLower;
+        const tickUpper = position.tickUpper;
+
+        console.log(`\n💰 TOPPING UP POSITION...`);
+        console.log(`   Using existing range: tick [${tickLower}, ${tickUpper}]`);
+
+        // ── Rebalance dust to match position's tick range ratio ──────────────
+        // @ts-ignore
+        const sqrtPriceX64: BN = poolInfo.sqrtPriceX64;
+        const Q64 = new Decimal(2).pow(64);
+        const sP  = new Decimal(sqrtPriceX64.toString());
+        const sPa = new Decimal(TickUtils.getTickPrice({ poolInfo, tick: tickLower, baseIn: true }).tickSqrtPriceX64.toString());
+        const sPb = new Decimal(TickUtils.getTickPrice({ poolInfo, tick: tickUpper, baseIn: true }).tickSqrtPriceX64.toString());
+        const price = new Decimal(poolInfo.price);
+
+        let iteration = 0;
+        const MAX_ITER = 6;
+
+        while (iteration < MAX_ITER) {
+            iteration++;
+            let usdcBal = await getTokenBalance(MINT_A);
+            let usdtBal = await getTokenBalance(MINT_B);
+
+            const usdcRaw = new Decimal(usdcBal.toString());
+            const usdtRaw = new Decimal(usdtBal.toString());
+            const totalUsdcVal = usdcRaw.add(usdtRaw.div(price));
+
+            let tUsdc: Decimal, tUsdt: Decimal;
+            if (sP.lte(sPa)) {
+                tUsdc = totalUsdcVal;
+                tUsdt = new Decimal(0);
+            } else if (sP.gte(sPb)) {
+                tUsdc = new Decimal(0);
+                tUsdt = totalUsdcVal.mul(price);
+            } else {
+                const R = sPb.sub(sP).mul(Q64).mul(Q64).div(sP.mul(sPb).mul(sP.sub(sPa)));
+                tUsdt = totalUsdcVal.div(R.add(new Decimal(1).div(price)));
+                tUsdc = R.mul(tUsdt);
+            }
+
+            const diffUsdc = usdcRaw.sub(tUsdc);
+            const residualUsd = diffUsdc.abs().div(1e6);
+
+            console.log(`\n⚖️  Iter ${iteration}: USDC=${usdcRaw.div(1e6).toFixed(4)}, USDT=${usdtRaw.div(1e6).toFixed(4)}`);
+            console.log(`   Target USDC=${tUsdc.div(1e6).toFixed(4)}, Target USDT=${tUsdt.div(1e6).toFixed(4)}`);
+            console.log(`   Residual: $${residualUsd.toFixed(4)}`);
+
+            if (residualUsd.lte(REBALANCE_RESIDUAL_USD)) {
+                console.log("✅ Residual under $1 — balance achieved.");
+                break;
+            }
+
+            let swapTx: VersionedTransaction | null = null;
+            if (diffUsdc.gt(0)) {
+                const swapAmt = diffUsdc.toFixed(0);
+                console.log(`🔄 Selling ${new Decimal(swapAmt).div(1e6).toFixed(4)} USDC → USDT`);
+                swapTx = await getJupiterSwapTx(MINT_A, MINT_B, swapAmt);
+            } else {
+                const usdtDiff = usdtRaw.sub(tUsdt);
+                const swapAmt = usdtDiff.toFixed(0);
+                console.log(`🔄 Selling ${new Decimal(swapAmt).div(1e6).toFixed(4)} USDT → USDC`);
+                swapTx = await getJupiterSwapTx(MINT_B, MINT_A, swapAmt);
+            }
+
+            if (!swapTx) { console.error("❌ Jupiter returned no swap tx — aborting top-up rebalance."); return; }
+            await sendAndConfirm(swapTx);
+            await new Promise(r => setTimeout(r, 3000));
+        }
+
+        // ── Increase liquidity ──────────────────────────────────────────────
+        let usdcBal = await getTokenBalance(MINT_A);
+        let usdtBal = await getTokenBalance(MINT_B);
+
+        if (usdcBal.isZero() && usdtBal.isZero()) {
+            console.log("   No tokens after rebalance.");
+            return;
+        }
+
+        await raydium.account.fetchWalletTokenAccounts();
+
+        const useUsdtAsBase = usdtBal.gt(usdcBal);
+        const rawBase = useUsdtAsBase ? usdtBal : usdcBal;
+        const BUFFER = new BN(500_000);
+        const baseAmount = rawBase.sub(BUFFER);
+        const otherMax = useUsdtAsBase ? usdcBal : usdtBal;
+
+        console.log(`\n📤 Increasing liquidity: base=${baseAmount.toNumber()/1e6} ${useUsdtAsBase ? 'USDT' : 'USDC'}, otherMax=${otherMax.toNumber()/1e6} ${useUsdtAsBase ? 'USDC' : 'USDT'}`);
+
+        // @ts-ignore
+        const { transaction: increaseTx, signers: increaseSigners } = await raydium.clmm.increasePositionFromBase({
+            poolInfo,
+            ownerPosition: position,
+            baseAmount,
+            otherAmountMax: otherMax,
+            base: useUsdtAsBase ? 'MintB' : 'MintA',
+            ownerInfo: { useSOLBalance: false },
+            txVersion: TxVersion.LEGACY
+        });
+
+        const tx = increaseTx as Transaction;
+        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+        tx.recentBlockhash = blockhash;
+        tx.feePayer = walletAddress;
+
+        if (increaseSigners && increaseSigners.length > 0) {
+            tx.sign(...increaseSigners);
+        }
+
+        console.log(`📋 Increase-liquidity tx has ${tx.instructions.length} instructions`);
+
+        // Simulate before sending
+        try {
+            const simResult = await connection.simulateTransaction(tx);
+            if (simResult.value.err) {
+                console.error("⚠️ Simulation failed:", JSON.stringify(simResult.value.err));
+                console.error("   Logs:", simResult.value.logs?.join('\n   '));
+                console.error("❌ Aborting top-up — simulation failed.");
+                return;
+            } else {
+                console.log("✅ Simulation passed");
+            }
+        } catch (simErr: any) {
+            console.error("⚠️ Simulation error:", simErr.message);
+            console.error("❌ Aborting top-up — simulation error.");
+            return;
+        }
+
+        const signedTx = await ledgerSigner.signTransaction(tx);
+        const txId = await connection.sendRawTransaction(signedTx.serialize(), { skipPreflight: true });
+        console.log(`TX Sent: ${txId}. Verifying...`);
+        const result = await connection.confirmTransaction({ signature: txId, blockhash, lastValidBlockHeight }, 'confirmed');
+        if (result.value.err) throw new Error(`Transaction failed: ${JSON.stringify(result.value.err)}`);
+        console.log(`✅ Liquidity increased: ${txId}`);
+
+        const dustUsdc = await getTokenBalance(MINT_A);
+        const dustUsdt = await getTokenBalance(MINT_B);
+        console.log(`💰 Remaining dust: ${dustUsdc.toNumber()/1e6} USDC, ${dustUsdt.toNumber()/1e6} USDT`);
+
+    } catch (err: any) { console.error('Top-up Error:', err); }
+}
+
 async function mainLoop() {
     try {
         console.log('\n--- Loop ---');
@@ -454,7 +605,17 @@ async function mainLoop() {
                 const updated = await raydium.clmm.getPoolInfoFromRpc(POOL_ID.toBase58());
                 await rebalanceAndDeposit(updated.poolInfo, updated.poolKeys);
             } else {
-                console.log("✅ Position is in range and centered. No action needed.");
+                // Check if there's undeposited dust to top up
+                const usdcDust = await getTokenBalance(MINT_A);
+                const usdtDust = await getTokenBalance(MINT_B);
+                const dustValue = new Decimal(usdcDust.toString()).add(new Decimal(usdtDust.toString()).div(1e6));
+
+                if (dustValue.gt(5)) {
+                    console.log(`💵 Found $${dustValue.toFixed(2)} undeposited — topping up position...`);
+                    await topUpPosition(myPosition, poolInfo, poolKeys);
+                } else {
+                    console.log("✅ Position is in range and centered. No action needed.");
+                }
             }
         }
     } catch (err: any) { console.error('Loop Error:', err.message); }
