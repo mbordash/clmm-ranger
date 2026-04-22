@@ -323,12 +323,13 @@ async function rebalanceAndDeposit(
         // Use whichever token is larger as the "base" for openPositionFromBase.
         // Pass the full balance of the other token as otherAmountMax so the SDK
         // uses as much as possible without leaving dust.
-        // Hold back a tiny fixed buffer from baseAmount so the SDK's computed
+        // Hold back a fixed buffer from baseAmount so the SDK's computed
         // otherAmount doesn't exceed our wallet balance due to micro price moves.
-        // For a stablecoin pair, $0.50 buffer (500_000 raw) is more than enough.
+        // $0.50 was too tight in practice (PriceSlippageCheck 6021 with ~$0.26 overshoot);
+        // use $2.00 to give comfortable headroom on stablecoin pairs.
         const useUsdtAsBase = usdtBal.gt(usdcBal);
         const rawBase  = useUsdtAsBase ? usdtBal : usdcBal;
-        const BUFFER = new BN(500_000); // $0.50 in 6-decimal raw units
+        const BUFFER = new BN(2_000_000); // $2.00 in 6-decimal raw units
         const baseAmount = rawBase.sub(BUFFER);
         const otherMax   = useUsdtAsBase ? usdcBal : usdtBal;
 
@@ -404,6 +405,23 @@ async function rebalanceAndDeposit(
         const dustUsdc = await getTokenBalance(MINT_A);
         const dustUsdt = await getTokenBalance(MINT_B);
         console.log(`💰 Remaining dust: ${dustUsdc.toNumber()/1e6} USDC, ${dustUsdt.toNumber()/1e6} USDT`);
+
+        // ── Dust sweep: top up with any leftover balance ────────────────────
+        // The $2 open-buffer typically leaves ~$2–3 of dust. Now that the position
+        // exists we can sweep it cheaply via increasePositionFromBase (no NFT rent).
+        const dustValue = new Decimal(dustUsdc.toString()).add(new Decimal(dustUsdt.toString())).div(1e6);
+        if (dustValue.gt(1)) {
+            console.log(`💵 Auto-sweeping $${dustValue.toFixed(2)} of post-open dust...`);
+            await new Promise(r => setTimeout(r, 2000));
+            const freshPositions = await raydium.clmm.getOwnerPositionInfo({ programId: ACTUAL_PROGRAM_ID });
+            const newPosition = freshPositions.find(p => p.poolId.equals(new PublicKey(poolInfo.id)) &&
+                p.tickLower === tickLower && p.tickUpper === tickUpper);
+            if (newPosition) {
+                await topUpPosition(newPosition, poolInfo, poolKeys);
+            } else {
+                console.log("⚠️ Could not find newly opened position for dust sweep — skipping.");
+            }
+        }
 
     } catch (err: any) { console.error('Deposit Error:', err); }
 }
@@ -500,7 +518,7 @@ async function topUpPosition(
 
         const useUsdtAsBase = usdtBal.gt(usdcBal);
         const rawBase = useUsdtAsBase ? usdtBal : usdcBal;
-        const BUFFER = new BN(500_000);
+        const BUFFER = new BN(250_000); // $0.25 — tight buffer; no NFT rent risk on increase
         const baseAmount = rawBase.sub(BUFFER);
         const otherMax = useUsdtAsBase ? usdcBal : usdtBal;
 
