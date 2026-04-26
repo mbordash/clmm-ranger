@@ -70,15 +70,29 @@ async function getTokenBalance(mint: PublicKey): Promise<BN> {
 
 async function getJupiterSwapTx(inputMint: PublicKey, outputMint: PublicKey, amount: string): Promise<VersionedTransaction | null> {
     try {
-        const { data: quoteResponse } = await axios.get(`https://api.jup.ag/swap/v1/quote?inputMint=${inputMint.toBase58()}&outputMint=${outputMint.toBase58()}&amount=${amount}&slippageBps=50`);
-        const { data: { swapTransaction } } = await axios.post('https://api.jup.ag/swap/v1/swap', { quoteResponse, userPublicKey: walletAddress.toString(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: 'auto' });
+        // MATCHING YOUR UI SETTINGS: 20 BPS Slippage (0.2%)
+        const { data: quoteResponse } = await axios.get(`https://api.jup.ag/swap/v1/quote?inputMint=${inputMint.toBase58()}&outputMint=${outputMint.toBase58()}&amount=${amount}&slippageBps=20`);
+        
+        // MATCHING YOUR UI SETTINGS: Using a fixed, low priority fee instead of 'auto'
+        const { data: { swapTransaction } } = await axios.post('https://api.jup.ag/swap/v1/swap', { 
+            quoteResponse, 
+            userPublicKey: walletAddress.toString(), 
+            wrapAndUnwrapSol: true, 
+            dynamicComputeUnitLimit: false, 
+            prioritizationFeeLamports: 50000 // Fixed 0.00005 SOL priority tip (matches Ultra V3 style)
+        });
         return VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
     } catch (e) { return null; }
 }
 
 async function sendAndConfirm(tx: Transaction | VersionedTransaction) {
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-    if (tx instanceof Transaction) { tx.recentBlockhash = blockhash; tx.feePayer = walletAddress; }
+    if (tx instanceof Transaction) { 
+        tx.recentBlockhash = blockhash; 
+        tx.feePayer = walletAddress; 
+    } else {
+        tx.message.recentBlockhash = blockhash;
+    }
     const signedTx = await ledgerSigner.signTransaction(tx);
     const signature = await connection.sendRawTransaction(signedTx.serialize(), { skipPreflight: true });
     console.log(`TX Sent: ${signature}`);
@@ -92,12 +106,57 @@ async function sendAndConfirm(tx: Transaction | VersionedTransaction) {
 async function safeWithdrawAll(position: any) {
     console.log(`\n🛡️ WITHDRAWING...`);
     const poolInfoRaw = await raydium.clmm.getPoolInfoFromRpc(position.poolId.toBase58());
+
+    if (poolInfoRaw.poolKeys.rewardInfos && poolInfoRaw.poolKeys.rewardInfos.length > 0) {
+        // @ts-ignore
+        poolInfoRaw.poolInfo.rewardDefaultInfos = poolInfoRaw.poolKeys.rewardInfos.map((r: any) => ({
+            mint: r.mint, vault: r.vault, openTime: '0', endTime: '0', emissionsPerSecondX64: '0',
+            rewardTotalEmissioned: 0, rewardClaimed: 0, tokenProgramId: r.mint?.programId ?? TOKEN_PROGRAM_ID.toBase58(),
+            creator: '', type: 'Standard SPL' as any, perSecond: 0,
+        }));
+    }
+
+    const nftMintInfo = await connection.getAccountInfo(position.nftMint);
+    const nftTokenProgram: PublicKey = nftMintInfo?.owner ?? TOKEN_PROGRAM_ID;
+    const sdkNftAta = getAssociatedTokenAddressSync(position.nftMint, walletAddress, false, TOKEN_PROGRAM_ID);
+    const correctNftAta = getAssociatedTokenAddressSync(position.nftMint, walletAddress, false, nftTokenProgram);
+    const atasDiffer = !correctNftAta.equals(sdkNftAta);
+
     // @ts-ignore
     const { transaction: decreaseTx } = await raydium.clmm.decreaseLiquidity({
-        poolInfo: poolInfoRaw.poolInfo, ownerPosition: position, ownerInfo: { useSOLBalance: false, closePosition: true },
+        poolInfo: poolInfoRaw.poolInfo, ownerPosition: position, ownerInfo: { useSOLBalance: false, closePosition: false },
         liquidity: position.liquidity, amountMinA: new BN(0), amountMinB: new BN(0), txVersion: TxVersion.LEGACY
     });
-    await sendAndConfirm(decreaseTx as Transaction);
+    
+    const CLMM_PROG = new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK');
+    const decreaseTransaction = decreaseTx as Transaction;
+    if (atasDiffer) {
+        for (const ix of decreaseTransaction.instructions) {
+            if (ix.programId.equals(CLMM_PROG)) {
+                for (const key of ix.keys) if (key.pubkey.equals(sdkNftAta)) key.pubkey = correctNftAta;
+            }
+        }
+    }
+    await sendAndConfirm(decreaseTransaction);
+    await new Promise(r => setTimeout(r, 2000));
+
+    // @ts-ignore
+    const { transaction: closeTx } = await raydium.clmm.closePosition({
+        poolInfo: poolInfoRaw.poolInfo, ownerPosition: position, txVersion: TxVersion.LEGACY
+    });
+
+    const closeTransaction = closeTx as Transaction;
+    if (atasDiffer) {
+        for (const ix of closeTransaction.instructions) {
+            if (ix.programId.equals(CLMM_PROG)) {
+                for (const key of ix.keys) {
+                    if (key.pubkey.equals(sdkNftAta)) key.pubkey = correctNftAta;
+                    if (key.pubkey.equals(TOKEN_PROGRAM_ID)) key.pubkey = nftTokenProgram;
+                }
+            }
+        }
+    }
+    await sendAndConfirm(closeTransaction);
 }
 
 async function getRatioMath(poolInfo: ApiV3PoolInfoConcentratedItem, tickLower: number, tickUpper: number) {
@@ -109,8 +168,8 @@ async function getRatioMath(poolInfo: ApiV3PoolInfoConcentratedItem, tickLower: 
     const price = new Decimal(poolInfo.price);
 
     let R: Decimal;
-    if (sP.lte(sPa)) R = new Decimal(1e18); // 100% USDC
-    else if (sP.gte(sPb)) R = new Decimal(0); // 100% USDT
+    if (sP.lte(sPa)) R = new Decimal(1e18); 
+    else if (sP.gte(sPb)) R = new Decimal(0);
     else R = sPb.sub(sP).mul(Q64).mul(Q64).div(sP.mul(sPb).mul(sP.sub(sPa)));
 
     return { R, price, sP, sPa, sPb };
@@ -131,16 +190,18 @@ async function rebalanceToRatio(poolInfo: ApiV3PoolInfoConcentratedItem, tickLow
     const targetUsdc = R.mul(targetUsdt);
 
     console.log(`⚖️ Wallet: USDC ${(usdcRaw.toNumber()/1e6).toFixed(2)}, USDT ${(usdtRaw.toNumber()/1e6).toFixed(2)}`);
-    console.log(`🎯 Target: USDC ${(targetUsdc.toNumber()/1e6).toFixed(2)}, USDT ${(targetUsdt.toNumber()/1e6).toFixed(2)}`);
-
     const diffUsdc = usdcRaw.sub(targetUsdc);
-    if (diffUsdc.abs().gt(1_000_000)) { // Swap if off by > $1.00
+    if (diffUsdc.abs().gt(1_000_000)) {
         console.log(`🔄 Rebalancing: ${diffUsdc.gt(0) ? "Selling USDC for USDT" : "Selling USDT for USDC"}`);
         const swapTx = diffUsdc.gt(0) 
             ? await getJupiterSwapTx(MINT_A, MINT_B, diffUsdc.toFixed(0))
             : await getJupiterSwapTx(MINT_B, MINT_A, usdtRaw.sub(targetUsdt).toFixed(0));
-        if (swapTx) await sendAndConfirm(swapTx);
-        await new Promise(r => setTimeout(r, 2000));
+        if (swapTx) {
+            await sendAndConfirm(swapTx);
+            console.log("Waiting for swap to settle...");
+            await new Promise(r => setTimeout(r, 3000));
+            await raydium.account.fetchWalletTokenAccounts();
+        }
     }
 }
 
@@ -152,10 +213,6 @@ async function depositLiquidity(poolInfo: ApiV3PoolInfoConcentratedItem, poolKey
     if (usdcBal.add(usdtBal).lt(new BN(2_000_000))) return;
 
     const { R } = await getRatioMath(poolInfo, tickLower, tickUpper);
-    
-    // Strategy: Use the "scarce" token as base to prevent running out of the "abundant" one.
-    // If R < 1, pool wants more USDT than USDC. Use USDC as base.
-    // If R > 1, pool wants more USDC than USDT. Use USDT as base.
     const useUsdcAsBase = R.lt(1); 
     const baseAmount = (useUsdcAsBase ? usdcBal : usdtBal).mul(new BN(90)).div(new BN(100));
 
@@ -178,6 +235,9 @@ async function depositLiquidity(poolInfo: ApiV3PoolInfoConcentratedItem, poolKey
     }
 
     const tx = result.transaction as Transaction;
+    const { blockhash } = await connection.getLatestBlockhash();
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = walletAddress;
     const validSigners = (result.signers || []).filter(s => s instanceof Keypair);
     if (validSigners.length > 0) tx.sign(...validSigners);
     await sendAndConfirm(tx);
