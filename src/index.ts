@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Connection, PublicKey, VersionedTransaction, Transaction, Keypair } from '@solana/web3.js';
+import { Connection, PublicKey, VersionedTransaction, Transaction, Keypair, TransactionInstruction } from '@solana/web3.js';
 import { Raydium, TickUtils, ApiV3PoolInfoConcentratedItem, TxVersion } from '@raydium-io/raydium-sdk-v2';
 import { getAssociatedTokenAddressSync, getAccount, TOKEN_PROGRAM_ID, createAssociatedTokenAccountIdempotentInstruction } from '@solana/spl-token';
 import TransportNodeHid from "@ledgerhq/hw-transport-node-hid";
@@ -16,7 +16,7 @@ const MINT_B = new PublicKey(process.env.MINT_B ?? 'Es9vMFrzaCERmJfrF4H2FYD4KCoN
 const POOL_ID = new PublicKey(process.env.POOL_ID!);
 const ACTUAL_PROGRAM_ID = new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK');
 
-const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS ?? '60000');
+const CHECK_INTERVAL_MS = 120_000; 
 const TARGET_WALLET = process.env.WALLET_ADDRESS!;
 const LEDGER_PATH = process.env.LEDGER_PATH ?? "44'/501'";
 
@@ -70,43 +70,51 @@ async function getTokenBalance(mint: PublicKey): Promise<BN> {
 
 async function getJupiterSwapTx(inputMint: PublicKey, outputMint: PublicKey, amount: string): Promise<VersionedTransaction | null> {
     try {
-        // MATCHING YOUR UI SETTINGS: 20 BPS Slippage (0.2%)
         const { data: quoteResponse } = await axios.get(`https://api.jup.ag/swap/v1/quote?inputMint=${inputMint.toBase58()}&outputMint=${outputMint.toBase58()}&amount=${amount}&slippageBps=20`);
-        
-        // MATCHING YOUR UI SETTINGS: Using a fixed, low priority fee instead of 'auto'
-        const { data: { swapTransaction } } = await axios.post('https://api.jup.ag/swap/v1/swap', { 
-            quoteResponse, 
-            userPublicKey: walletAddress.toString(), 
-            wrapAndUnwrapSol: true, 
-            dynamicComputeUnitLimit: false, 
-            prioritizationFeeLamports: 50000 // Fixed 0.00005 SOL priority tip (matches Ultra V3 style)
-        });
+        const { data: { swapTransaction } } = await axios.post('https://api.jup.ag/swap/v1/swap', { quoteResponse, userPublicKey: walletAddress.toString(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: false, prioritizationFeeLamports: 50000 });
         return VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
     } catch (e) { return null; }
 }
 
-async function sendAndConfirm(tx: Transaction | VersionedTransaction) {
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-    if (tx instanceof Transaction) { 
-        tx.recentBlockhash = blockhash; 
-        tx.feePayer = walletAddress; 
+async function sendAndConfirm(tx: Transaction | VersionedTransaction, label: string) {
+    const startBal = await connection.getBalance(walletAddress);
+    let blockhash: string;
+    let lastValidBlockHeight: number;
+
+    if (tx instanceof Transaction) {
+        const res = await connection.getLatestBlockhash();
+        if (!tx.recentBlockhash) {
+            tx.recentBlockhash = res.blockhash;
+            tx.feePayer = walletAddress;
+        }
+        blockhash = res.blockhash;
+        lastValidBlockHeight = res.lastValidBlockHeight;
     } else {
-        tx.message.recentBlockhash = blockhash;
+        blockhash = tx.message.recentBlockhash;
+        const res = await connection.getLatestBlockhash();
+        lastValidBlockHeight = res.lastValidBlockHeight;
     }
+
     const signedTx = await ledgerSigner.signTransaction(tx);
     const signature = await connection.sendRawTransaction(signedTx.serialize(), { skipPreflight: true });
-    console.log(`TX Sent: ${signature}`);
+    console.log(`TX Sent [${label}]: ${signature}`);
+    
     const result = await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');
     if (result.value.err) throw new Error(`TX Failed: ${JSON.stringify(result.value.err)}`);
+    
+    const endBal = await connection.getBalance(walletAddress);
+    const diff = (startBal - endBal) / 1e9;
+    console.log(`💸 [${label}] Net SOL Change: ${diff.toFixed(6)} SOL`);
     return signature;
 }
 
 // ====================== CORE ACTIONS ======================
 
 async function safeWithdrawAll(position: any) {
-    console.log(`\n🛡️ WITHDRAWING...`);
+    console.log(`\n🛡️ CONSOLIDATED WITHDRAWAL...`);
     const poolInfoRaw = await raydium.clmm.getPoolInfoFromRpc(position.poolId.toBase58());
-
+    
+    // Populate rewards for SDK
     if (poolInfoRaw.poolKeys.rewardInfos && poolInfoRaw.poolKeys.rewardInfos.length > 0) {
         // @ts-ignore
         poolInfoRaw.poolInfo.rewardDefaultInfos = poolInfoRaw.poolKeys.rewardInfos.map((r: any) => ({
@@ -122,41 +130,36 @@ async function safeWithdrawAll(position: any) {
     const correctNftAta = getAssociatedTokenAddressSync(position.nftMint, walletAddress, false, nftTokenProgram);
     const atasDiffer = !correctNftAta.equals(sdkNftAta);
 
+    // SINGLE ATOMIC CALL: Withdraw + Harvest + Burn + Close
     // @ts-ignore
-    const { transaction: decreaseTx } = await raydium.clmm.decreaseLiquidity({
-        poolInfo: poolInfoRaw.poolInfo, ownerPosition: position, ownerInfo: { useSOLBalance: false, closePosition: false },
-        liquidity: position.liquidity, amountMinA: new BN(0), amountMinB: new BN(0), txVersion: TxVersion.LEGACY
+    const { transaction } = await raydium.clmm.decreaseLiquidity({
+        poolInfo: poolInfoRaw.poolInfo,
+        ownerPosition: position,
+        liquidity: position.liquidity,
+        amountMinA: new BN(0),
+        amountMinB: new BN(0),
+        ownerInfo: { 
+            useSOLBalance: false, 
+            closePosition: true  // This bundles the full cleanup
+        },
+        txVersion: TxVersion.LEGACY
     });
     
-    const CLMM_PROG = new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK');
-    const decreaseTransaction = decreaseTx as Transaction;
+    const tx = transaction as Transaction;
     if (atasDiffer) {
-        for (const ix of decreaseTransaction.instructions) {
-            if (ix.programId.equals(CLMM_PROG)) {
-                for (const key of ix.keys) if (key.pubkey.equals(sdkNftAta)) key.pubkey = correctNftAta;
-            }
-        }
-    }
-    await sendAndConfirm(decreaseTransaction);
-    await new Promise(r => setTimeout(r, 2000));
-
-    // @ts-ignore
-    const { transaction: closeTx } = await raydium.clmm.closePosition({
-        poolInfo: poolInfoRaw.poolInfo, ownerPosition: position, txVersion: TxVersion.LEGACY
-    });
-
-    const closeTransaction = closeTx as Transaction;
-    if (atasDiffer) {
-        for (const ix of closeTransaction.instructions) {
-            if (ix.programId.equals(CLMM_PROG)) {
-                for (const key of ix.keys) {
-                    if (key.pubkey.equals(sdkNftAta)) key.pubkey = correctNftAta;
-                    if (key.pubkey.equals(TOKEN_PROGRAM_ID)) key.pubkey = nftTokenProgram;
+        const CLMM_PROG = new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK');
+        for (const ix of tx.instructions) {
+            for (const key of ix.keys) {
+                if (key.pubkey.equals(sdkNftAta)) key.pubkey = correctNftAta;
+                // Also patch token program if hardcoded to Legacy
+                if (key.pubkey.equals(TOKEN_PROGRAM_ID) && !nftTokenProgram.equals(TOKEN_PROGRAM_ID)) {
+                    key.pubkey = nftTokenProgram;
                 }
             }
         }
     }
-    await sendAndConfirm(closeTransaction);
+
+    await sendAndConfirm(tx, "Atomic Withdraw & Full Rent Recovery");
 }
 
 async function getRatioMath(poolInfo: ApiV3PoolInfoConcentratedItem, tickLower: number, tickUpper: number) {
@@ -166,42 +169,28 @@ async function getRatioMath(poolInfo: ApiV3PoolInfoConcentratedItem, tickLower: 
     const sPb = new Decimal(TickUtils.getTickPrice({ poolInfo, tick: tickUpper, baseIn: true }).tickSqrtPriceX64.toString());
     const Q64 = new Decimal(2).pow(64);
     const price = new Decimal(poolInfo.price);
-
     let R: Decimal;
     if (sP.lte(sPa)) R = new Decimal(1e18); 
     else if (sP.gte(sPb)) R = new Decimal(0);
     else R = sPb.sub(sP).mul(Q64).mul(Q64).div(sP.mul(sPb).mul(sP.sub(sPa)));
-
-    return { R, price, sP, sPa, sPb };
+    return { R, price };
 }
 
 async function rebalanceToRatio(poolInfo: ApiV3PoolInfoConcentratedItem, tickLower: number, tickUpper: number) {
     const { R, price } = await getRatioMath(poolInfo, tickLower, tickUpper);
-    
     await raydium.account.fetchWalletTokenAccounts();
     const usdcBal = await getTokenBalance(MINT_A);
     const usdtBal = await getTokenBalance(MINT_B);
-    
-    const usdcRaw = new Decimal(usdcBal.toString());
-    const usdtRaw = new Decimal(usdtBal.toString());
-    const totalUsdcVal = usdcRaw.add(usdtRaw.div(price));
-
+    const totalUsdcVal = new Decimal(usdcBal.toString()).add(new Decimal(usdtBal.toString()).div(price));
     const targetUsdt = totalUsdcVal.div(R.add(new Decimal(1).div(price)));
     const targetUsdc = R.mul(targetUsdt);
 
-    console.log(`⚖️ Wallet: USDC ${(usdcRaw.toNumber()/1e6).toFixed(2)}, USDT ${(usdtRaw.toNumber()/1e6).toFixed(2)}`);
-    const diffUsdc = usdcRaw.sub(targetUsdc);
-    if (diffUsdc.abs().gt(1_000_000)) {
+    console.log(`⚖️ Wallet: USDC ${(usdcBal.toNumber()/1e6).toFixed(2)}, USDT ${(usdtBal.toNumber()/1e6).toFixed(2)}`);
+    const diffUsdc = new Decimal(usdcBal.toString()).sub(targetUsdc);
+    if (diffUsdc.abs().gt(100_000)) { 
         console.log(`🔄 Rebalancing: ${diffUsdc.gt(0) ? "Selling USDC for USDT" : "Selling USDT for USDC"}`);
-        const swapTx = diffUsdc.gt(0) 
-            ? await getJupiterSwapTx(MINT_A, MINT_B, diffUsdc.toFixed(0))
-            : await getJupiterSwapTx(MINT_B, MINT_A, usdtRaw.sub(targetUsdt).toFixed(0));
-        if (swapTx) {
-            await sendAndConfirm(swapTx);
-            console.log("Waiting for swap to settle...");
-            await new Promise(r => setTimeout(r, 3000));
-            await raydium.account.fetchWalletTokenAccounts();
-        }
+        const swapTx = diffUsdc.gt(0) ? await getJupiterSwapTx(MINT_A, MINT_B, diffUsdc.toFixed(0)) : await getJupiterSwapTx(MINT_B, MINT_A, new Decimal(usdtBal.toString()).sub(targetUsdt).toFixed(0));
+        if (swapTx) { await sendAndConfirm(swapTx, "Jupiter Rebalance Swap"); await new Promise(r => setTimeout(r, 2000)); await raydium.account.fetchWalletTokenAccounts(); }
     }
 }
 
@@ -209,38 +198,23 @@ async function depositLiquidity(poolInfo: ApiV3PoolInfoConcentratedItem, poolKey
     await raydium.account.fetchWalletTokenAccounts();
     const usdcBal = await getTokenBalance(MINT_A);
     const usdtBal = await getTokenBalance(MINT_B);
-
-    if (usdcBal.add(usdtBal).lt(new BN(2_000_000))) return;
-
+    if (usdcBal.add(usdtBal).lt(new BN(500_000))) return;
     const { R } = await getRatioMath(poolInfo, tickLower, tickUpper);
     const useUsdcAsBase = R.lt(1); 
-    const baseAmount = (useUsdcAsBase ? usdcBal : usdtBal).mul(new BN(90)).div(new BN(100));
+    const bufferPercent = 99; 
+    const baseAmount = (useUsdcAsBase ? usdcBal : usdtBal).mul(new BN(bufferPercent)).div(new BN(100));
 
     console.log(`🚀 ${isNew ? "Opening" : "Top-up"} via ${useUsdcAsBase ? "USDC" : "USDT"} (Ratio: ${R.toFixed(4)})`);
+    let res;
+    if (isNew) res = await raydium.clmm.openPositionFromBase({ poolInfo, poolKeys, tickLower, tickUpper, baseAmount, otherAmountMax: useUsdcAsBase ? usdtBal : usdcBal, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, txVersion: TxVersion.LEGACY });
+    else res = await raydium.clmm.increasePositionFromBase({ poolInfo, ownerPosition: position, baseAmount, otherAmountMax: useUsdcAsBase ? usdtBal : usdcBal, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, txVersion: TxVersion.LEGACY });
 
-    let result;
-    if (isNew) {
-        result = await raydium.clmm.openPositionFromBase({
-            poolInfo, poolKeys, tickLower, tickUpper, baseAmount, 
-            otherAmountMax: useUsdcAsBase ? usdtBal : usdcBal,
-            base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, txVersion: TxVersion.LEGACY
-        });
-    } else {
-        // @ts-ignore
-        result = await raydium.clmm.increasePositionFromBase({
-            poolInfo, ownerPosition: position, baseAmount, 
-            otherAmountMax: useUsdcAsBase ? usdtBal : usdcBal,
-            base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, txVersion: TxVersion.LEGACY
-        });
-    }
-
-    const tx = result.transaction as Transaction;
+    const tx = res.transaction as Transaction;
     const { blockhash } = await connection.getLatestBlockhash();
-    tx.recentBlockhash = blockhash;
-    tx.feePayer = walletAddress;
-    const validSigners = (result.signers || []).filter(s => s instanceof Keypair);
+    tx.recentBlockhash = blockhash; tx.feePayer = walletAddress;
+    const validSigners = (res.signers || []).filter(s => s instanceof Keypair);
     if (validSigners.length > 0) tx.sign(...validSigners);
-    await sendAndConfirm(tx);
+    await sendAndConfirm(tx, isNew ? "Open Position (NFT Rent Pay)" : "Increase Liquidity");
 }
 
 async function mainLoop() {
@@ -250,7 +224,6 @@ async function mainLoop() {
         const poolInfo = poolInfoRaw.poolInfo;
         const positions = await raydium.clmm.getOwnerPositionInfo({ programId: ACTUAL_PROGRAM_ID });
         const myPosition = positions.find(p => p.poolId.equals(POOL_ID));
-
         // @ts-ignore
         const tickCurrent = poolInfo.tickCurrent ?? 0;
         const tickSpacing = poolInfo.config.tickSpacing;
@@ -267,10 +240,10 @@ async function mainLoop() {
             } else {
                 const usdc = await getTokenBalance(MINT_A);
                 const usdt = await getTokenBalance(MINT_B);
-                if (usdc.add(usdt).gt(new BN(5_000_000))) {
+                if (usdc.add(usdt).gt(new BN(10_000_000))) {
                     await rebalanceToRatio(poolInfo, tickLower, tickUpper);
                     await depositLiquidity(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper, false, myPosition);
-                } else console.log("✅ Position Healthy");
+                } else console.log("✅ Position Healthy (Dust < $10)");
             }
         }
     } catch (e: any) { console.error('Loop Error:', e.message); }
