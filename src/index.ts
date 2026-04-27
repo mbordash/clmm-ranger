@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Connection, PublicKey, VersionedTransaction, Transaction, Keypair, TransactionInstruction } from '@solana/web3.js';
+import { Connection, PublicKey, VersionedTransaction, Transaction, Keypair } from '@solana/web3.js';
 import { Raydium, TickUtils, ApiV3PoolInfoConcentratedItem, TxVersion } from '@raydium-io/raydium-sdk-v2';
 import { getAssociatedTokenAddressSync, getAccount, TOKEN_PROGRAM_ID, createAssociatedTokenAccountIdempotentInstruction } from '@solana/spl-token';
 import TransportNodeHid from "@ledgerhq/hw-transport-node-hid";
@@ -114,7 +114,6 @@ async function safeWithdrawAll(position: any) {
     console.log(`\n🛡️ CONSOLIDATED WITHDRAWAL...`);
     const poolInfoRaw = await raydium.clmm.getPoolInfoFromRpc(position.poolId.toBase58());
     
-    // Populate rewards for SDK
     if (poolInfoRaw.poolKeys.rewardInfos && poolInfoRaw.poolKeys.rewardInfos.length > 0) {
         // @ts-ignore
         poolInfoRaw.poolInfo.rewardDefaultInfos = poolInfoRaw.poolKeys.rewardInfos.map((r: any) => ({
@@ -140,7 +139,7 @@ async function safeWithdrawAll(position: any) {
         amountMinB: new BN(0),
         ownerInfo: { 
             useSOLBalance: false, 
-            closePosition: true  // This bundles the full cleanup
+            closePosition: true
         },
         txVersion: TxVersion.LEGACY
     });
@@ -151,7 +150,6 @@ async function safeWithdrawAll(position: any) {
         for (const ix of tx.instructions) {
             for (const key of ix.keys) {
                 if (key.pubkey.equals(sdkNftAta)) key.pubkey = correctNftAta;
-                // Also patch token program if hardcoded to Legacy
                 if (key.pubkey.equals(TOKEN_PROGRAM_ID) && !nftTokenProgram.equals(TOKEN_PROGRAM_ID)) {
                     key.pubkey = nftTokenProgram;
                 }
@@ -198,10 +196,11 @@ async function depositLiquidity(poolInfo: ApiV3PoolInfoConcentratedItem, poolKey
     await raydium.account.fetchWalletTokenAccounts();
     const usdcBal = await getTokenBalance(MINT_A);
     const usdtBal = await getTokenBalance(MINT_B);
-    if (usdcBal.add(usdtBal).lt(new BN(500_000))) return;
+    if (usdcBal.add(usdtBal).lt(new BN(100_000))) return; // Sweep even small $0.10 amounts
+
     const { R } = await getRatioMath(poolInfo, tickLower, tickUpper);
     const useUsdcAsBase = R.lt(1); 
-    const bufferPercent = 99; 
+    const bufferPercent = 99; // 1% buffer to maximize deposit
     const baseAmount = (useUsdcAsBase ? usdcBal : usdtBal).mul(new BN(bufferPercent)).div(new BN(100));
 
     console.log(`🚀 ${isNew ? "Opening" : "Top-up"} via ${useUsdcAsBase ? "USDC" : "USDT"} (Ratio: ${R.toFixed(4)})`);
@@ -214,7 +213,7 @@ async function depositLiquidity(poolInfo: ApiV3PoolInfoConcentratedItem, poolKey
     tx.recentBlockhash = blockhash; tx.feePayer = walletAddress;
     const validSigners = (res.signers || []).filter(s => s instanceof Keypair);
     if (validSigners.length > 0) tx.sign(...validSigners);
-    await sendAndConfirm(tx, isNew ? "Open Position (NFT Rent Pay)" : "Increase Liquidity");
+    await sendAndConfirm(tx, isNew ? "Open Position" : "Increase Liquidity");
 }
 
 async function mainLoop() {
@@ -240,10 +239,11 @@ async function mainLoop() {
             } else {
                 const usdc = await getTokenBalance(MINT_A);
                 const usdt = await getTokenBalance(MINT_B);
-                if (usdc.add(usdt).gt(new BN(10_000_000))) {
+                // TRIGGER SWEEP IF DUST > $1.00
+                if (usdc.add(usdt).gt(new BN(1_000_000))) {
                     await rebalanceToRatio(poolInfo, tickLower, tickUpper);
                     await depositLiquidity(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper, false, myPosition);
-                } else console.log("✅ Position Healthy (Dust < $10)");
+                } else console.log("✅ Position Healthy (Dust < $1)");
             }
         }
     } catch (e: any) { console.error('Loop Error:', e.message); }
