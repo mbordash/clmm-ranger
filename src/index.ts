@@ -205,7 +205,7 @@ async function depositLiquidity(poolInfo: ApiV3PoolInfoConcentratedItem, poolKey
 
     console.log(`🚀 ${isNew ? "Opening" : "Top-up"} via ${useUsdcAsBase ? "USDC" : "USDT"} (Ratio: ${R.toFixed(4)})`);
     let res;
-    if (isNew) res = await raydium.clmm.openPositionFromBase({ poolInfo, poolKeys, tickLower, tickUpper, baseAmount, otherAmountMax: useUsdcAsBase ? usdtBal : usdcBal, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, txVersion: TxVersion.LEGACY });
+    if (isNew) res = await raydium.clmm.openPositionFromBase({ poolInfo, poolKeys, tickLower, tickUpper, baseAmount, otherAmountMax: useUsdcAsBase ? usdtBal : usdcBal, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, withMetadata: 'no-create', txVersion: TxVersion.LEGACY });
     else res = await raydium.clmm.increasePositionFromBase({ poolInfo, ownerPosition: position, baseAmount, otherAmountMax: useUsdcAsBase ? usdtBal : usdcBal, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, txVersion: TxVersion.LEGACY });
 
     const tx = res.transaction as Transaction;
