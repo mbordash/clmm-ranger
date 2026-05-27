@@ -192,21 +192,48 @@ async function rebalanceToRatio(poolInfo: ApiV3PoolInfoConcentratedItem, tickLow
     }
 }
 
-async function depositLiquidity(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any, tickLower: number, tickUpper: number, isNew: boolean, position?: any) {
+async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolKeys: any, tickLower: number, tickUpper: number, isNew: boolean, position?: any) {
+    // Always re-fetch pool state immediately before building the deposit tx.
+    // The poolInfo passed in may be stale (fetched at loop start, before Ledger
+    // confirmations for swaps). A stale sqrtPriceX64 produces a wrong R which
+    // causes 6021 PriceSlippageCheck when the on-chain price has since drifted.
+    const freshRaw  = await raydium.clmm.getPoolInfoFromRpc(POOL_ID.toBase58());
+    const poolInfo  = freshRaw.poolInfo;
+    const poolKeys  = freshRaw.poolKeys;
+
     await raydium.account.fetchWalletTokenAccounts();
     const usdcBal = await getTokenBalance(MINT_A);
     const usdtBal = await getTokenBalance(MINT_B);
-    if (usdcBal.add(usdtBal).lt(new BN(100_000))) return; // Sweep even small $0.10 amounts
+    if (usdcBal.add(usdtBal).lt(new BN(100_000))) return;
 
     const { R } = await getRatioMath(poolInfo, tickLower, tickUpper);
-    const useUsdcAsBase = R.lt(1); 
-    const bufferPercent = 99; // 1% buffer to maximize deposit
-    const baseAmount = (useUsdcAsBase ? usdcBal : usdtBal).mul(new BN(bufferPercent)).div(new BN(100));
+
+    // Always use the DOMINANT token (higher target %) as base.
+    //   R = USDC/USDT.  R ≥ 1 → USDC dominant → useUsdcAsBase.
+    //                   R < 1 → USDT dominant → useUsdtAsBase.
+    //
+    // Why dominant-as-base avoids 6021:
+    //   required_other = base × R_onchain.  "other" is the MINOR token
+    //   (small balance), so even a 10% move in R_onchain keeps required_other
+    //   well within our minor-token balance.
+    //
+    //   The old minor-token-as-base approach (e.g. USDC base when R=0.023)
+    //   computes required_other = base / R, which is 43× larger. Any tiny
+    //   downward drift in R (price drifting toward upper tick, the likely
+    //   direction when R is already small) pushes required_other above the
+    //   full USDT balance → 6021.
+    const useUsdcAsBase = R.gte(1);
+    const rawBase  = useUsdcAsBase ? usdcBal : usdtBal;
+    const rawOther = useUsdcAsBase ? usdtBal : usdcBal;
+
+    const baseAmount  = rawBase.mul(new BN(95)).div(new BN(100));
+    const otherAmount = rawOther; // full balance — never a binding constraint
 
     console.log(`🚀 ${isNew ? "Opening" : "Top-up"} via ${useUsdcAsBase ? "USDC" : "USDT"} (Ratio: ${R.toFixed(4)})`);
     let res;
-    if (isNew) res = await raydium.clmm.openPositionFromBase({ poolInfo, poolKeys, tickLower, tickUpper, baseAmount, otherAmountMax: useUsdcAsBase ? usdtBal : usdcBal, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, withMetadata: 'no-create', txVersion: TxVersion.LEGACY });
-    else res = await raydium.clmm.increasePositionFromBase({ poolInfo, ownerPosition: position, baseAmount, otherAmountMax: useUsdcAsBase ? usdtBal : usdcBal, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, txVersion: TxVersion.LEGACY });
+    if (isNew) res = await raydium.clmm.openPositionFromBase({ poolInfo, poolKeys, tickLower, tickUpper, baseAmount, otherAmountMax: otherAmount, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, withMetadata: 'no-create', txVersion: TxVersion.LEGACY });
+    // @ts-ignore
+    else res = await raydium.clmm.increasePositionFromBase({ poolInfo, ownerPosition: position, baseAmount, otherAmountMax: otherAmount, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, txVersion: TxVersion.LEGACY });
 
     const tx = res.transaction as Transaction;
     const { blockhash } = await connection.getLatestBlockhash();
@@ -214,6 +241,30 @@ async function depositLiquidity(poolInfo: ApiV3PoolInfoConcentratedItem, poolKey
     const validSigners = (res.signers || []).filter(s => s instanceof Keypair);
     if (validSigners.length > 0) tx.sign(...validSigners);
     await sendAndConfirm(tx, isNew ? "Open Position" : "Increase Liquidity");
+}
+
+/**
+ * Repeatedly top-up the active position until wallet dust drops below $1.
+ * Each call to depositLiquidity deposits 90% of the dominant token; this loop
+ * runs immediately (no inter-loop wait) until the remainder is negligible.
+ */
+async function sweepDust(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any, tickLower: number, tickUpper: number) {
+    const MAX_ROUNDS = 6;
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+        await new Promise(r => setTimeout(r, 1500)); // brief settle for RPC state
+        const usdc = await getTokenBalance(MINT_A);
+        const usdt = await getTokenBalance(MINT_B);
+        if (usdc.add(usdt).lte(new BN(1_000_000))) {
+            if (round > 0) console.log("✅ Dust cleared.");
+            return;
+        }
+        // Find the current position (needed for increasePositionFromBase)
+        const positions = await raydium.clmm.getOwnerPositionInfo({ programId: ACTUAL_PROGRAM_ID });
+        const pos = positions.find(p => p.poolId.equals(POOL_ID) && !p.liquidity.isZero());
+        if (!pos) { console.log("⚠️ sweepDust: no active position found, skipping."); return; }
+        console.log(`🧹 Sweep round ${round + 1}: $${(usdc.toNumber() + usdt.toNumber()) / 1e6} remaining`);
+        await depositLiquidity(poolInfo, poolKeys, tickLower, tickUpper, false, pos);
+    }
 }
 
 async function mainLoop() {
@@ -232,17 +283,28 @@ async function mainLoop() {
         if (!myPosition || myPosition.liquidity.isZero()) {
             await rebalanceToRatio(poolInfo, tickLower, tickUpper);
             await depositLiquidity(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper, true);
+            // Sweep remaining dust immediately (no loop wait)
+            await sweepDust(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper);
         } else {
             if (myPosition.tickLower !== tickLower) {
                 console.log("🔁 Out of range, re-ranging...");
                 await safeWithdrawAll(myPosition);
+                const updated = await raydium.clmm.getPoolInfoFromRpc(POOL_ID.toBase58());
+                const updatedInfo = updated.poolInfo;
+                // @ts-ignore
+                const newTick = updatedInfo.tickCurrent ?? 0;
+                const newTickSpacing = updatedInfo.config.tickSpacing;
+                const newTickLower = Math.floor(newTick / newTickSpacing) * newTickSpacing;
+                const newTickUpper = newTickLower + newTickSpacing;
+                await rebalanceToRatio(updatedInfo, newTickLower, newTickUpper);
+                await depositLiquidity(updatedInfo, updated.poolKeys, newTickLower, newTickUpper, true);
+                await sweepDust(updatedInfo, updated.poolKeys, newTickLower, newTickUpper);
             } else {
                 const usdc = await getTokenBalance(MINT_A);
                 const usdt = await getTokenBalance(MINT_B);
-                // TRIGGER SWEEP IF DUST > $1.00
                 if (usdc.add(usdt).gt(new BN(1_000_000))) {
                     await rebalanceToRatio(poolInfo, tickLower, tickUpper);
-                    await depositLiquidity(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper, false, myPosition);
+                    await sweepDust(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper);
                 } else console.log("✅ Position Healthy (Dust < $1)");
             }
         }
@@ -252,8 +314,14 @@ async function mainLoop() {
 async function startBot() {
     await initRaydium();
     while (true) {
+        const loopStart = Date.now();
         await mainLoop();
-        await new Promise(r => setTimeout(r, CHECK_INTERVAL_MS));
+        const elapsed = Date.now() - loopStart;
+        const remaining = Math.max(0, CHECK_INTERVAL_MS - elapsed);
+        if (remaining > 0) {
+            console.log(`⏱ Next check in ${(remaining / 1000).toFixed(0)}s`);
+            await new Promise(r => setTimeout(r, remaining));
+        }
     }
 }
 startBot();
