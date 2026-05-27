@@ -1,6 +1,6 @@
 # clmm-ranger
 
-Automated [Raydium CLMM](https://raydium.io/) position re-ranger for Solana, with **Ledger hardware wallet** signing.
+Automated [Raydium CLMM](https://raydium.io/) position re-ranger for Solana, with optional **Ledger hardware wallet** or **hot wallet private key** signing.
 
 The bot monitors a concentrated-liquidity pool and keeps your position in the tightest possible tick range around the current price. When the price drifts out of range it automatically:
 
@@ -17,8 +17,10 @@ Designed for stablecoin pairs (e.g. USDC/USDT) but works with any Raydium CLMM p
 ## Requirements
 
 - **Node.js** ≥ 18
-- **Ledger** hardware wallet connected via USB with the Solana app open
 - A Solana RPC endpoint (e.g. [Helius](https://helius.dev/), [Triton](https://triton.one/))
+- One signing mode:
+  - **Ledger mode**: Ledger connected via USB with the Solana app open
+  - **Hot wallet mode**: base58 private key in env (`WALLET_PRIVATE_KEY`)
 
 ## Setup
 
@@ -34,13 +36,39 @@ Edit `.env` with your values:
 | Variable | Description |
 |---|---|
 | `RPC_URL` | Solana RPC endpoint (with API key) |
-| `WALLET_ADDRESS` | Your Solana wallet address (must match Ledger) |
 | `POOL_ID` | Raydium CLMM pool to manage |
 | `MINT_A` / `MINT_B` | Token mints (defaults to USDC/USDT) |
-| `LEDGER_PATH` | Ledger derivation path (default `44'/501'`) |
-| `CHECK_INTERVAL_MS` | Poll interval in ms (default `60000`) |
-| `REBALANCE_RESIDUAL_USD` | Max residual imbalance in USD before stopping swaps (default `1.0`) |
-| `MIN_SOL_LAMPORTS` | Minimum SOL to keep for rent (default `35000000`) |
+| `CHECK_INTERVAL_MS` | Poll interval in ms |
+| `WALLET_PRIVATE_KEY` | **Hot wallet mode** (base58 64-byte secret key). If set, this mode is used |
+| `WALLET_ADDRESS` | **Ledger mode** safety check (recommended) |
+| `LEDGER_PATH` | **Ledger mode** derivation path (default `44'/501'`) |
+
+### Wallet Mode Switching
+
+The bot auto-selects signing mode using this rule:
+
+1. If `WALLET_PRIVATE_KEY` is set -> **hot wallet mode**
+2. If `WALLET_PRIVATE_KEY` is empty/unset -> **Ledger mode**
+
+Use one of these `.env` snippets:
+
+**Ledger mode**
+
+```dotenv
+# Leave hot key unset/commented
+# WALLET_PRIVATE_KEY=
+
+WALLET_ADDRESS=YourLedgerPubkey
+LEDGER_PATH=44'/501'
+```
+
+**Hot wallet mode**
+
+```dotenv
+WALLET_PRIVATE_KEY=YourBase58SecretKey
+# Optional in hot-wallet mode:
+# WALLET_ADDRESS=YourPubkey
+```
 
 ## Usage
 
@@ -49,10 +77,10 @@ npm start
 ```
 
 The bot will:
-- Connect to your Ledger and verify the wallet address
+- Use hot wallet signing when `WALLET_PRIVATE_KEY` is present; otherwise use Ledger signing
 - Check for an existing CLMM position
 - Re-range if the position is stale or out of range
-- Prompt you to confirm each transaction on the Ledger
+- Prompt for Ledger confirmation only when running in Ledger mode
 
 ## How It Works
 
@@ -65,9 +93,11 @@ The bot will:
 
 ## ⚠️ Disclaimer
 
-This software is provided as-is. Use at your own risk. The authors are not responsible for any financial losses. Always verify transactions on your Ledger before confirming.
+This software is provided as-is. Use at your own risk. The authors are not responsible for any financial losses.
+
+- In Ledger mode, always verify transaction details on-device before confirming.
+- In hot wallet mode, protect `.env` carefully and never commit or share `WALLET_PRIVATE_KEY`.
 
 ## License
 
 [GPL-3.0](LICENSE)
-

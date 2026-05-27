@@ -16,9 +16,10 @@ const MINT_B = new PublicKey(process.env.MINT_B ?? 'Es9vMFrzaCERmJfrF4H2FYD4KCoN
 const POOL_ID = new PublicKey(process.env.POOL_ID!);
 const ACTUAL_PROGRAM_ID = new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK');
 
-const CHECK_INTERVAL_MS = 120_000; 
-const TARGET_WALLET = process.env.WALLET_ADDRESS!;
+const CHECK_INTERVAL_MS = 120_000;
+const TARGET_WALLET = process.env.WALLET_ADDRESS;   // optional in hot-wallet mode
 const LEDGER_PATH = process.env.LEDGER_PATH ?? "44'/501'";
+const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY; // base58 private key — set to use hot wallet instead of Ledger
 
 Decimal.set({ precision: 80, rounding: Decimal.ROUND_HALF_UP });
 
@@ -26,18 +27,36 @@ Decimal.set({ precision: 80, rounding: Decimal.ROUND_HALF_UP });
 const connection = new Connection(RPC_URL, 'confirmed');
 let raydium: Raydium;
 let walletAddress: PublicKey;
-let ledgerSigner: any;
+let ledgerSigner: any; // aliased to signer below for backward compat
+
+async function getHotWalletSigner(privateKeyB58: string) {
+    const keypair = Keypair.fromSecretKey(bs58.decode(privateKeyB58));
+    const publicKey = keypair.publicKey;
+    console.log(`🔑 Hot wallet mode: ${publicKey.toBase58()}`);
+    return {
+        publicKey,
+        signTransaction: async (tx: Transaction | VersionedTransaction) => {
+            if (tx instanceof Transaction) {
+                tx.partialSign(keypair);
+            } else {
+                tx.sign([keypair]);
+            }
+            return tx;
+        }
+    };
+}
 
 async function getLedgerSigner() {
     const transport = await TransportNodeHid.create();
     const solanaApp = new SolanaApp(transport);
     const { address } = await solanaApp.getAddress(LEDGER_PATH);
     const addrStr = Buffer.isBuffer(address) ? bs58.encode(address) : address;
-    if (addrStr !== TARGET_WALLET) throw new Error("Wallet mismatch");
+    if (TARGET_WALLET && addrStr !== TARGET_WALLET) throw new Error("Wallet mismatch");
     const publicKey = new PublicKey(addrStr);
+    console.log(`🔐 Ledger mode: ${publicKey.toBase58()}`);
     return {
         publicKey,
-        signTransaction: async (tx: any) => {
+        signTransaction: async (tx: Transaction | VersionedTransaction) => {
             console.log("\n📲 Please confirm on Ledger...");
             const message = tx instanceof Transaction ? tx.serializeMessage() : tx.message.serialize();
             const { signature } = await solanaApp.signTransaction(LEDGER_PATH, Buffer.from(message));
@@ -48,13 +67,18 @@ async function getLedgerSigner() {
 }
 
 async function initRaydium() {
-    ledgerSigner = await getLedgerSigner();
-    walletAddress = ledgerSigner.publicKey;
-    raydium = await Raydium.load({ connection, owner: walletAddress, signAllTransactions: async (txs) => {
+    const signer = WALLET_PRIVATE_KEY
+        ? await getHotWalletSigner(WALLET_PRIVATE_KEY)
+        : await getLedgerSigner();
+
+    ledgerSigner = signer; // alias so all existing ledgerSigner.signTransaction() calls work unchanged
+    walletAddress = signer.publicKey;
+
+    raydium = await Raydium.load({ connection, owner: walletAddress, signAllTransactions: (async (txs: (Transaction | VersionedTransaction)[]) => {
         const signed = [];
-        for (const tx of txs) signed.push(await ledgerSigner.signTransaction(tx));
+        for (const tx of txs) signed.push(await signer.signTransaction(tx));
         return signed;
-    }});
+    }) as any });
     // @ts-ignore
     raydium.clmm.programId = ACTUAL_PROGRAM_ID;
     console.log(`✅ Bot Ready: ${walletAddress.toBase58()}`);
@@ -254,16 +278,27 @@ async function sweepDust(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any,
         await new Promise(r => setTimeout(r, 1500)); // brief settle for RPC state
         const usdc = await getTokenBalance(MINT_A);
         const usdt = await getTokenBalance(MINT_B);
-        if (usdc.add(usdt).lte(new BN(1_000_000))) {
+        const totalDust = usdc.add(usdt);
+        if (totalDust.lte(new BN(1_000_000))) {
             if (round > 0) console.log("✅ Dust cleared.");
             return;
         }
-        // Find the current position (needed for increasePositionFromBase)
+        console.log(`🧹 Sweep round ${round + 1}: $${(totalDust.toNumber() / 1e6).toFixed(2)} remaining`);
+
+        // Re-fetch fresh pool state so R is accurate before each round.
+        // Without this, a stale R (e.g. R=27.9 with USDT nearly exhausted) causes
+        // the loop to deposit only a tiny sliver per round — USDC bottlenecked by
+        // the depleted USDT "other" balance — and never converges.
+        const freshRaw = await raydium.clmm.getPoolInfoFromRpc(POOL_ID.toBase58());
+
+        // Rebalance to current ratio so each deposit can absorb the full 95% of base.
+        await rebalanceToRatio(freshRaw.poolInfo, tickLower, tickUpper);
+        await new Promise(r => setTimeout(r, 1500));
+
         const positions = await raydium.clmm.getOwnerPositionInfo({ programId: ACTUAL_PROGRAM_ID });
         const pos = positions.find(p => p.poolId.equals(POOL_ID) && !p.liquidity.isZero());
         if (!pos) { console.log("⚠️ sweepDust: no active position found, skipping."); return; }
-        console.log(`🧹 Sweep round ${round + 1}: $${(usdc.toNumber() + usdt.toNumber()) / 1e6} remaining`);
-        await depositLiquidity(poolInfo, poolKeys, tickLower, tickUpper, false, pos);
+        await depositLiquidity(freshRaw.poolInfo, freshRaw.poolKeys, tickLower, tickUpper, false, pos);
     }
 }
 
