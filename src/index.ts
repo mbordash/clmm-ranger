@@ -5,6 +5,7 @@ import { getAssociatedTokenAddressSync, getAccount, TOKEN_PROGRAM_ID, createAsso
 import TransportNodeHid from "@ledgerhq/hw-transport-node-hid";
 import SolanaApp from "@ledgerhq/hw-app-solana";
 import axios from 'axios';
+import { lookup } from 'node:dns/promises';
 import BN from 'bn.js';
 import Decimal from 'decimal.js';
 import bs58 from 'bs58';
@@ -20,6 +21,7 @@ const CHECK_INTERVAL_MS = 120_000;
 const TARGET_WALLET = process.env.WALLET_ADDRESS;   // optional in hot-wallet mode
 const LEDGER_PATH = process.env.LEDGER_PATH ?? "44'/501'";
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY; // base58 private key — set to use hot wallet instead of Ledger
+const DISABLE_RAYDIUM_TOKEN_LOAD = (process.env.DISABLE_RAYDIUM_TOKEN_LOAD ?? 'true').toLowerCase() !== 'false';
 
 Decimal.set({ precision: 80, rounding: Decimal.ROUND_HALF_UP });
 
@@ -66,6 +68,19 @@ async function getLedgerSigner() {
     };
 }
 
+async function preflightNetworkCheck() {
+    const hosts = ['api.jup.ag'];
+    if (!DISABLE_RAYDIUM_TOKEN_LOAD) hosts.push('tokens.jup.ag');
+
+    for (const host of hosts) {
+        try {
+            await lookup(host);
+        } catch {
+            console.warn(`⚠️ DNS lookup failed for ${host}. Check server DNS/egress if swaps fail.`);
+        }
+    }
+}
+
 async function initRaydium() {
     const signer = WALLET_PRIVATE_KEY
         ? await getHotWalletSigner(WALLET_PRIVATE_KEY)
@@ -74,14 +89,20 @@ async function initRaydium() {
     ledgerSigner = signer; // alias so all existing ledgerSigner.signTransaction() calls work unchanged
     walletAddress = signer.publicKey;
 
-    raydium = await Raydium.load({ connection, owner: walletAddress, signAllTransactions: (async (txs: (Transaction | VersionedTransaction)[]) => {
-        const signed = [];
-        for (const tx of txs) signed.push(await signer.signTransaction(tx));
-        return signed;
-    }) as any });
+    await preflightNetworkCheck();
+    raydium = await Raydium.load({
+        connection,
+        owner: walletAddress,
+        disableLoadToken: DISABLE_RAYDIUM_TOKEN_LOAD,
+        signAllTransactions: (async (txs: (Transaction | VersionedTransaction)[]) => {
+            const signed = [];
+            for (const tx of txs) signed.push(await signer.signTransaction(tx));
+            return signed;
+        }) as any
+    });
     // @ts-ignore
     raydium.clmm.programId = ACTUAL_PROGRAM_ID;
-    console.log(`✅ Bot Ready: ${walletAddress.toBase58()}`);
+    console.log(`✅ Bot Ready: ${walletAddress.toBase58()} (token preload ${DISABLE_RAYDIUM_TOKEN_LOAD ? 'disabled' : 'enabled'})`);
 }
 
 async function getTokenBalance(mint: PublicKey): Promise<BN> {

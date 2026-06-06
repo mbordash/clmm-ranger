@@ -42,6 +42,7 @@ Edit `.env` with your values:
 | `WALLET_PRIVATE_KEY` | **Hot wallet mode** (base58 64-byte secret key). If set, this mode is used |
 | `WALLET_ADDRESS` | **Ledger mode** safety check (recommended) |
 | `LEDGER_PATH` | **Ledger mode** derivation path (default `44'/501'`) |
+| `DISABLE_RAYDIUM_TOKEN_LOAD` | Disable Raydium token-list preload on startup (default `true`) |
 
 ### Wallet Mode Switching
 
@@ -75,6 +76,66 @@ WALLET_PRIVATE_KEY=YourBase58SecretKey
 ```bash
 npm start
 ```
+
+## Docker
+
+Container mode is best for **hot wallet mode** (`WALLET_PRIVATE_KEY`).
+
+Ledger mode usually needs USB passthrough and device permissions, which are not included in the default container setup below.
+
+Build and run locally:
+
+```bash
+docker build -t clmm-ranger:latest .
+docker run --rm --name clmm-ranger --env-file .env clmm-ranger:latest
+```
+
+## Deploy To AWS Host
+
+This repo includes `deploy.sh.example`, which:
+
+1. Syncs the project to your server
+2. Uploads your local `.env`
+3. Builds the Docker image on the server
+4. Recreates and starts the container with restart policy
+
+Default target is:
+
+- `ubuntu@52.211.208.155`
+- key: `~/.ssh/rustpolybot-ireland-key-2026.pem`
+
+Create your local deploy script from the template:
+
+```bash
+cp deploy.sh.example deploy.sh
+chmod +x deploy.sh
+```
+
+Then run deploy:
+
+```bash
+./deploy.sh
+```
+
+Useful overrides:
+
+```bash
+SSH_HOST=52.211.208.155 SSH_USER=ubuntu ./deploy.sh
+```
+
+`deploy.sh` is intentionally gitignored so each developer can keep their own host/key defaults.
+
+Follow logs on server:
+
+```bash
+ssh -i ~/.ssh/rustpolybot-ireland-key-2026.pem ubuntu@52.211.208.155 'docker logs -f clmm-ranger'
+```
+
+### Startup Log Noise (ENOTFOUND tokens.jup.ag)
+
+If your server DNS/egress blocks `tokens.jup.ag`, Raydium SDK can print a large Axios stack trace during startup token preload. The bot can still run, but logs become noisy.
+
+By default this repo sets `DISABLE_RAYDIUM_TOKEN_LOAD=true`, which skips that preload and avoids the startup stack dump.
 
 The bot will:
 - Use hot wallet signing when `WALLET_PRIVATE_KEY` is present; otherwise use Ledger signing

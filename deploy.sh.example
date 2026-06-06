@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Copy this file to deploy.sh and customize defaults for your server:
+#   cp deploy.sh.example deploy.sh
+#   chmod +x deploy.sh
+
+# Local settings (all can be overridden at runtime via env vars)
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/your-aws-key.pem}"
+SSH_USER="${SSH_USER:-ubuntu}"
+SSH_HOST="${SSH_HOST:-YOUR_SERVER_IP_OR_DNS}"
+
+APP_NAME="${APP_NAME:-clmm-ranger}"
+REMOTE_DIR="${REMOTE_DIR:-/home/${SSH_USER}/${APP_NAME}}"
+IMAGE_NAME="${IMAGE_NAME:-${APP_NAME}:latest}"
+CONTAINER_NAME="${CONTAINER_NAME:-${APP_NAME}}"
+
+if [[ ! -f "$SSH_KEY" ]]; then
+  echo "Error: SSH key not found at $SSH_KEY"
+  exit 1
+fi
+
+if [[ ! -f ".env" ]]; then
+  echo "Error: .env file is required in the project root before deployment."
+  exit 1
+fi
+
+SSH_OPTS=("-i" "$SSH_KEY" "-o" "StrictHostKeyChecking=accept-new")
+TARGET="${SSH_USER}@${SSH_HOST}"
+
+echo "==> Creating remote directory: $REMOTE_DIR"
+ssh "${SSH_OPTS[@]}" "$TARGET" "mkdir -p '$REMOTE_DIR'"
+
+echo "==> Syncing project files"
+rsync -az --delete \
+  --exclude '.git' \
+  --exclude 'node_modules' \
+  --exclude 'dist' \
+  --exclude '.env' \
+  -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new" \
+  ./ "$TARGET:$REMOTE_DIR/"
+
+echo "==> Uploading .env securely"
+scp "${SSH_OPTS[@]}" .env "$TARGET:$REMOTE_DIR/.env"
+
+echo "==> Building image and restarting container on remote host"
+ssh "${SSH_OPTS[@]}" "$TARGET" "bash -s" <<EOF
+set -euo pipefail
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Error: docker is not installed on remote host."
+  echo "Install it first, then rerun deploy.sh"
+  exit 1
+fi
+
+cd '$REMOTE_DIR'
+
+docker build -t '$IMAGE_NAME' .
+
+docker rm -f '$CONTAINER_NAME' >/dev/null 2>&1 || true
+
+docker run -d \
+  --name '$CONTAINER_NAME' \
+  --restart unless-stopped \
+  --env-file .env \
+  '$IMAGE_NAME'
+
+echo "Container status:"
+docker ps --filter "name=$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+
+echo
+echo "Recent logs:"
+docker logs --tail 50 '$CONTAINER_NAME' || true
+EOF
+
+echo
+echo "Deploy complete."
+echo "To follow logs: ssh -i $SSH_KEY $TARGET 'docker logs -f $CONTAINER_NAME'"
+
