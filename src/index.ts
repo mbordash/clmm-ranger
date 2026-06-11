@@ -253,6 +253,23 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
 
     const { R } = await getRatioMath(poolInfo, tickLower, tickUpper);
 
+    // Final safety guard: if RPC lag made mainLoop miss an existing active
+    // position, do not mint a second NFT. Switch open -> top-up instead.
+    let effectiveIsNew = isNew;
+    let effectivePosition = position;
+    if (effectiveIsNew) {
+        const active = await getActivePoolPosition(5, 1500);
+        if (active) {
+            console.warn("⚠️ Active position detected in open path; switching to top-up to avoid duplicate position.");
+            effectiveIsNew = false;
+            effectivePosition = active;
+        }
+    }
+    if (!effectiveIsNew && !effectivePosition) {
+        console.warn("⚠️ No position available for top-up; skipping deposit call.");
+        return;
+    }
+
     // Always use the DOMINANT token (higher target %) as base.
     //   R = USDC/USDT.  R ≥ 1 → USDC dominant → useUsdcAsBase.
     //                   R < 1 → USDT dominant → useUsdtAsBase.
@@ -274,18 +291,18 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
     const baseAmount  = rawBase.mul(new BN(95)).div(new BN(100));
     const otherAmount = rawOther; // full balance — never a binding constraint
 
-    console.log(`🚀 ${isNew ? "Opening" : "Top-up"} via ${useUsdcAsBase ? "USDC" : "USDT"} (Ratio: ${R.toFixed(4)})`);
+    console.log(`🚀 ${effectiveIsNew ? "Opening" : "Top-up"} via ${useUsdcAsBase ? "USDC" : "USDT"} (Ratio: ${R.toFixed(4)})`);
     let res;
-    if (isNew) res = await raydium.clmm.openPositionFromBase({ poolInfo, poolKeys, tickLower, tickUpper, baseAmount, otherAmountMax: otherAmount, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, withMetadata: 'no-create', txVersion: TxVersion.LEGACY });
+    if (effectiveIsNew) res = await raydium.clmm.openPositionFromBase({ poolInfo, poolKeys, tickLower, tickUpper, baseAmount, otherAmountMax: otherAmount, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, withMetadata: 'no-create', txVersion: TxVersion.LEGACY });
     // @ts-ignore
-    else res = await raydium.clmm.increasePositionFromBase({ poolInfo, ownerPosition: position, baseAmount, otherAmountMax: otherAmount, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, txVersion: TxVersion.LEGACY });
+    else res = await raydium.clmm.increasePositionFromBase({ poolInfo, ownerPosition: effectivePosition, baseAmount, otherAmountMax: otherAmount, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, txVersion: TxVersion.LEGACY });
 
     const tx = res.transaction as Transaction;
     const { blockhash } = await connection.getLatestBlockhash();
     tx.recentBlockhash = blockhash; tx.feePayer = walletAddress;
     const validSigners = (res.signers || []).filter(s => s instanceof Keypair);
     if (validSigners.length > 0) tx.sign(...validSigners);
-    await sendAndConfirm(tx, isNew ? "Open Position" : "Increase Liquidity");
+    await sendAndConfirm(tx, effectiveIsNew ? "Open Position" : "Increase Liquidity");
 }
 
 /**
