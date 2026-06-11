@@ -90,6 +90,26 @@ async function initRaydium() {
     walletAddress = signer.publicKey;
 
     await preflightNetworkCheck();
+
+    // Idempotent ATA creation for USDC and USDT to avoid dynamic rent overhead
+    console.log('🔧 Ensuring token accounts exist...');
+    const ataInstructions = [
+        createAssociatedTokenAccountIdempotentInstruction(walletAddress, getAssociatedTokenAddressSync(MINT_A, walletAddress, true), walletAddress, MINT_A),
+        createAssociatedTokenAccountIdempotentInstruction(walletAddress, getAssociatedTokenAddressSync(MINT_B, walletAddress, true), walletAddress, MINT_B)
+    ];
+    const setupTx = new Transaction().add(...ataInstructions);
+    const { blockhash } = await connection.getLatestBlockhash();
+    setupTx.recentBlockhash = blockhash;
+    setupTx.feePayer = walletAddress;
+    try {
+        const signedSetup = await signer.signTransaction(setupTx);
+        await connection.sendRawTransaction(signedSetup.serialize(), { skipPreflight: true });
+        await new Promise(r => setTimeout(r, 1000)); // brief settle
+    } catch (e: any) {
+        // Idempotent: if ATAs already exist, this is a no-op or error we can ignore
+        if (!e.message?.includes('already in use')) console.warn('ATA setup note:', e.message);
+    }
+
     raydium = await Raydium.load({
         connection,
         owner: walletAddress,
@@ -116,7 +136,7 @@ async function getTokenBalance(mint: PublicKey): Promise<BN> {
 async function getJupiterSwapTx(inputMint: PublicKey, outputMint: PublicKey, amount: string): Promise<VersionedTransaction | null> {
     try {
         const { data: quoteResponse } = await axios.get(`https://api.jup.ag/swap/v1/quote?inputMint=${inputMint.toBase58()}&outputMint=${outputMint.toBase58()}&amount=${amount}&slippageBps=20`);
-        const { data: { swapTransaction } } = await axios.post('https://api.jup.ag/swap/v1/swap', { quoteResponse, userPublicKey: walletAddress.toString(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: false, prioritizationFeeLamports: 50000 });
+        const { data: { swapTransaction } } = await axios.post('https://api.jup.ag/swap/v1/swap', { quoteResponse, userPublicKey: walletAddress.toString(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: false, prioritizationFeeLamports: "auto" });
         return VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
     } catch (e) { return null; }
 }
@@ -237,14 +257,19 @@ async function rebalanceToRatio(poolInfo: ApiV3PoolInfoConcentratedItem, tickLow
     }
 }
 
-async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolKeys: any, tickLower: number, tickUpper: number, isNew: boolean, position?: any) {
-    // Always re-fetch pool state immediately before building the deposit tx.
-    // The poolInfo passed in may be stale (fetched at loop start, before Ledger
-    // confirmations for swaps). A stale sqrtPriceX64 produces a wrong R which
-    // causes 6021 PriceSlippageCheck when the on-chain price has since drifted.
-    const freshRaw  = await raydium.clmm.getPoolInfoFromRpc(POOL_ID.toBase58());
-    const poolInfo  = freshRaw.poolInfo;
-    const poolKeys  = freshRaw.poolKeys;
+async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolKeys: any, tickLower: number, tickUpper: number, isNew: boolean, position?: any, preFetchedPoolData?: { poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any }) {
+    // Use pre-fetched pool data if caller already has fresh state (e.g. post-withdrawal),
+    // otherwise re-fetch to avoid stale sqrtPriceX64 causing 6021 PriceSlippageCheck.
+    let poolInfo: ApiV3PoolInfoConcentratedItem;
+    let poolKeys: any;
+    if (preFetchedPoolData) {
+        poolInfo = preFetchedPoolData.poolInfo;
+        poolKeys = preFetchedPoolData.poolKeys;
+    } else {
+        const freshRaw = await raydium.clmm.getPoolInfoFromRpc(POOL_ID.toBase58());
+        poolInfo = freshRaw.poolInfo;
+        poolKeys = freshRaw.poolKeys;
+    }
 
     await raydium.account.fetchWalletTokenAccounts();
     const usdcBal = await getTokenBalance(MINT_A);
@@ -306,18 +331,19 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
 }
 
 /**
- * Repeatedly top-up the active position until wallet dust drops below $1.
- * Each call to depositLiquidity deposits 90% of the dominant token; this loop
+ * Repeatedly top-up the active position until wallet dust drops below $5.
+ * Each call to depositLiquidity deposits 95% of the dominant token; this loop
  * runs immediately (no inter-loop wait) until the remainder is negligible.
+ * Capped at 2 rounds to prevent burning more in fees than the dust is worth.
  */
 async function sweepDust(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any, tickLower: number, tickUpper: number) {
-    const MAX_ROUNDS = 6;
+    const MAX_ROUNDS = 2;
     for (let round = 0; round < MAX_ROUNDS; round++) {
         await new Promise(r => setTimeout(r, 1500)); // brief settle for RPC state
         const usdc = await getTokenBalance(MINT_A);
         const usdt = await getTokenBalance(MINT_B);
         const totalDust = usdc.add(usdt);
-        if (totalDust.lte(new BN(1_000_000))) {
+        if (totalDust.lte(new BN(5_000_000))) {
             if (round > 0) console.log("✅ Dust cleared.");
             return;
         }
@@ -335,7 +361,7 @@ async function sweepDust(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any,
 
         const pos = await getActivePoolPosition(3, 1000);
         if (!pos) { console.log("⚠️ sweepDust: no active position found, skipping."); return; }
-        await depositLiquidity(freshRaw.poolInfo, freshRaw.poolKeys, tickLower, tickUpper, false, pos);
+        await depositLiquidity(freshRaw.poolInfo, freshRaw.poolKeys, tickLower, tickUpper, false, pos, { poolInfo: freshRaw.poolInfo, poolKeys: freshRaw.poolKeys });
     }
 }
 
@@ -390,15 +416,15 @@ async function mainLoop() {
                 const newTickLower = Math.floor(newTick / newTickSpacing) * newTickSpacing;
                 const newTickUpper = newTickLower + newTickSpacing;
                 await rebalanceToRatio(updatedInfo, newTickLower, newTickUpper);
-                await depositLiquidity(updatedInfo, updated.poolKeys, newTickLower, newTickUpper, true);
+                await depositLiquidity(updatedInfo, updated.poolKeys, newTickLower, newTickUpper, true, undefined, { poolInfo: updatedInfo, poolKeys: updated.poolKeys });
                 await sweepDust(updatedInfo, updated.poolKeys, newTickLower, newTickUpper);
             } else {
                 const usdc = await getTokenBalance(MINT_A);
                 const usdt = await getTokenBalance(MINT_B);
-                if (usdc.add(usdt).gt(new BN(1_000_000))) {
+                if (usdc.add(usdt).gt(new BN(5_000_000))) {
                     await rebalanceToRatio(poolInfo, tickLower, tickUpper);
                     await sweepDust(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper);
-                } else console.log("✅ Position Healthy (Dust < $1)");
+                } else console.log("✅ Position Healthy (Dust < $5)");
             }
         }
     } catch (e: any) { console.error('Loop Error:', e.message); }
