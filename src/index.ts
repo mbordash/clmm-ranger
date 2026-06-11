@@ -316,11 +316,32 @@ async function sweepDust(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any,
         await rebalanceToRatio(freshRaw.poolInfo, tickLower, tickUpper);
         await new Promise(r => setTimeout(r, 1500));
 
-        const positions = await raydium.clmm.getOwnerPositionInfo({ programId: ACTUAL_PROGRAM_ID });
-        const pos = positions.find(p => p.poolId.equals(POOL_ID) && !p.liquidity.isZero());
+        const pos = await getActivePoolPosition(3, 1000);
         if (!pos) { console.log("⚠️ sweepDust: no active position found, skipping."); return; }
         await depositLiquidity(freshRaw.poolInfo, freshRaw.poolKeys, tickLower, tickUpper, false, pos);
     }
+}
+
+async function getActivePoolPosition(maxAttempts = 3, delayMs = 1200): Promise<any | null> {
+    let lastPoolMatches: any[] = [];
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const positions = await raydium.clmm.getOwnerPositionInfo({ programId: ACTUAL_PROGRAM_ID });
+        const poolMatches = positions.filter(p => p.poolId.equals(POOL_ID));
+        const active = poolMatches.filter(p => !p.liquidity.isZero());
+        if (active.length > 0) {
+            if (active.length > 1) {
+                console.warn(`⚠️ Found ${active.length} active positions for pool; using largest liquidity position.`);
+            }
+            return active.reduce((best, p) => (p.liquidity.gt(best.liquidity) ? p : best));
+        }
+        lastPoolMatches = poolMatches;
+        if (attempt < maxAttempts) await new Promise(r => setTimeout(r, delayMs));
+    }
+
+    if (lastPoolMatches.length > 0) {
+        console.warn(`⚠️ Found ${lastPoolMatches.length} pool position(s), but all have zero liquidity.`);
+    }
+    return null;
 }
 
 async function mainLoop() {
@@ -328,15 +349,14 @@ async function mainLoop() {
         console.log('\n--- Loop ---');
         const poolInfoRaw = await raydium.clmm.getPoolInfoFromRpc(POOL_ID.toBase58());
         const poolInfo = poolInfoRaw.poolInfo;
-        const positions = await raydium.clmm.getOwnerPositionInfo({ programId: ACTUAL_PROGRAM_ID });
-        const myPosition = positions.find(p => p.poolId.equals(POOL_ID));
+        const myPosition = await getActivePoolPosition();
         // @ts-ignore
         const tickCurrent = poolInfo.tickCurrent ?? 0;
         const tickSpacing = poolInfo.config.tickSpacing;
         const tickLower = Math.floor(tickCurrent / tickSpacing) * tickSpacing;
         const tickUpper = tickLower + tickSpacing;
 
-        if (!myPosition || myPosition.liquidity.isZero()) {
+        if (!myPosition) {
             await rebalanceToRatio(poolInfo, tickLower, tickUpper);
             await depositLiquidity(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper, true);
             // Sweep remaining dust immediately (no loop wait)
