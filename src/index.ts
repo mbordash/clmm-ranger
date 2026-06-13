@@ -31,6 +31,13 @@ let raydium: Raydium;
 let walletAddress: PublicKey;
 let ledgerSigner: any; // aliased to signer below for backward compat
 
+// Tracks when the last "Open Position" TX was confirmed on-chain.
+// Even after a confirmed open, the RPC can take 90+ seconds to index the
+// new position NFT.  Without this guard, the next mainLoop iteration sees
+// myPosition=null and opens a SECOND position, burning SOL on duplicate rent.
+let lastConfirmedOpenAt = 0;       // epoch ms — 0 means "never"
+const OPEN_GUARD_MS = 5 * 60_000; // 5 minutes — safe margin for any RPC lag
+
 async function getHotWalletSigner(privateKeyB58: string) {
     const keypair = Keypair.fromSecretKey(bs58.decode(privateKeyB58));
     const publicKey = keypair.publicKey;
@@ -257,7 +264,7 @@ async function rebalanceToRatio(poolInfo: ApiV3PoolInfoConcentratedItem, tickLow
     }
 }
 
-async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolKeys: any, tickLower: number, tickUpper: number, isNew: boolean, position?: any, preFetchedPoolData?: { poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any }) {
+async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolKeys: any, tickLower: number, tickUpper: number, isNew: boolean, position?: any, preFetchedPoolData?: { poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any }): Promise<any | null> {
     // Use pre-fetched pool data if caller already has fresh state (e.g. post-withdrawal),
     // otherwise re-fetch to avoid stale sqrtPriceX64 causing 6021 PriceSlippageCheck.
     let poolInfo: ApiV3PoolInfoConcentratedItem;
@@ -280,10 +287,12 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
 
     // Final safety guard: if RPC lag made mainLoop miss an existing active
     // position, do not mint a second NFT. Switch open -> top-up instead.
+    // Use aggressive retries (10 × 2 s = up to 20 s) so slow RPC nodes don't
+    // cause a false "no position" result and a duplicate open.
     let effectiveIsNew = isNew;
     let effectivePosition = position;
     if (effectiveIsNew) {
-        const active = await getActivePoolPosition(5, 1500);
+        const active = await getActivePoolPosition(10, 2000);
         if (active) {
             console.warn("⚠️ Active position detected in open path; switching to top-up to avoid duplicate position.");
             effectiveIsNew = false;
@@ -292,7 +301,7 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
     }
     if (!effectiveIsNew && !effectivePosition) {
         console.warn("⚠️ No position available for top-up; skipping deposit call.");
-        return;
+        return null;
     }
 
     // Always use the DOMINANT token (higher target %) as base.
@@ -328,6 +337,23 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
     const validSigners = (res.signers || []).filter(s => s instanceof Keypair);
     if (validSigners.length > 0) tx.sign(...validSigners);
     await sendAndConfirm(tx, effectiveIsNew ? "Open Position" : "Increase Liquidity");
+
+    if (effectiveIsNew) {
+        // Record the confirmed open immediately.  Even if the RPC takes minutes
+        // to index the new NFT, mainLoop will see lastConfirmedOpenAt and refuse
+        // to fire a duplicate openPositionFromBase.
+        lastConfirmedOpenAt = Date.now();
+        console.log("⏳ Waiting for RPC to index new position...");
+        await new Promise(r => setTimeout(r, 10_000));
+        const newPos = await getActivePoolPosition(10, 2000);
+        if (newPos) {
+            console.log(`✅ New position confirmed on-chain: ${newPos.nftMint?.toBase58?.() ?? 'ok'}`);
+        } else {
+            console.warn("⚠️ Could not confirm new position on-chain after 30 s — proceeding cautiously.");
+        }
+        return newPos;
+    }
+    return effectivePosition ?? null;
 }
 
 /**
@@ -335,8 +361,11 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
  * Each call to depositLiquidity deposits 95% of the dominant token; this loop
  * runs immediately (no inter-loop wait) until the remainder is negligible.
  * Capped at 2 rounds to prevent burning more in fees than the dust is worth.
+ *
+ * @param knownPosition - pass the position returned by depositLiquidity to
+ *   avoid re-querying when RPC indexing lag would cause a false "not found".
  */
-async function sweepDust(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any, tickLower: number, tickUpper: number) {
+async function sweepDust(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any, tickLower: number, tickUpper: number, knownPosition?: any) {
     const MAX_ROUNDS = 2;
     for (let round = 0; round < MAX_ROUNDS; round++) {
         await new Promise(r => setTimeout(r, 1500)); // brief settle for RPC state
@@ -359,8 +388,12 @@ async function sweepDust(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any,
         await rebalanceToRatio(freshRaw.poolInfo, tickLower, tickUpper);
         await new Promise(r => setTimeout(r, 1500));
 
-        const pos = await getActivePoolPosition(3, 1000);
-        if (!pos) { console.log("⚠️ sweepDust: no active position found, skipping."); return; }
+        // Prefer the caller-supplied position hint (avoids re-query when RPC is slow
+        // to index a freshly-opened position).  Fall back to aggressive on-chain poll.
+        const pos = knownPosition ?? await getActivePoolPosition(10, 2000);
+        if (!pos) { console.log("⚠️ sweepDust: no active position found after extended wait, skipping."); return; }
+        // Clear hint after first round so subsequent rounds re-verify on-chain.
+        knownPosition = undefined;
         await depositLiquidity(freshRaw.poolInfo, freshRaw.poolKeys, tickLower, tickUpper, false, pos, { poolInfo: freshRaw.poolInfo, poolKeys: freshRaw.poolKeys });
     }
 }
@@ -392,7 +425,9 @@ async function mainLoop() {
         console.log('\n--- Loop ---');
         const poolInfoRaw = await raydium.clmm.getPoolInfoFromRpc(POOL_ID.toBase58());
         const poolInfo = poolInfoRaw.poolInfo;
-        const myPosition = await getActivePoolPosition();
+        // Use aggressive retries here so slow RPC nodes don't mistakenly report
+        // "no position" after a recent open and trigger a duplicate.
+        const myPosition = await getActivePoolPosition(8, 2000);
         // @ts-ignore
         const tickCurrent = poolInfo.tickCurrent ?? 0;
         const tickSpacing = poolInfo.config.tickSpacing;
@@ -400,13 +435,28 @@ async function mainLoop() {
         const tickUpper = tickLower + tickSpacing;
 
         if (!myPosition) {
+            // ── Duplicate-open guard ─────────────────────────────────────────────
+            // If we confirmed an openPositionFromBase TX less than OPEN_GUARD_MS ago
+            // but the RPC still hasn't indexed the NFT, DO NOT open a second position.
+            // Wait for the next loop iteration; the position will appear once the RPC
+            // catches up (observed lag: up to 90 + s on congested nodes).
+            const msSinceOpen = Date.now() - lastConfirmedOpenAt;
+            if (msSinceOpen < OPEN_GUARD_MS) {
+                console.log(`⏳ Open position TX confirmed ${(msSinceOpen / 1000).toFixed(0)}s ago — RPC indexing lag, skipping re-open to prevent duplicate.`);
+                return;
+            }
+            // ────────────────────────────────────────────────────────────────────
             await rebalanceToRatio(poolInfo, tickLower, tickUpper);
-            await depositLiquidity(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper, true);
-            // Sweep remaining dust immediately (no loop wait)
-            await sweepDust(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper);
+            const openedPosition = await depositLiquidity(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper, true);
+            // Pass the confirmed position directly so sweepDust doesn't need to
+            // re-query when the RPC is still slow to index.
+            await sweepDust(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper, openedPosition ?? undefined);
         } else {
             if (myPosition.tickLower !== tickLower) {
                 console.log("🔁 Out of range, re-ranging...");
+                // Clear the open-guard timestamp: we are about to close this
+                // position and open a fresh one, so the guard must not block it.
+                lastConfirmedOpenAt = 0;
                 await safeWithdrawAll(myPosition);
                 const updated = await raydium.clmm.getPoolInfoFromRpc(POOL_ID.toBase58());
                 const updatedInfo = updated.poolInfo;
@@ -416,14 +466,14 @@ async function mainLoop() {
                 const newTickLower = Math.floor(newTick / newTickSpacing) * newTickSpacing;
                 const newTickUpper = newTickLower + newTickSpacing;
                 await rebalanceToRatio(updatedInfo, newTickLower, newTickUpper);
-                await depositLiquidity(updatedInfo, updated.poolKeys, newTickLower, newTickUpper, true, undefined, { poolInfo: updatedInfo, poolKeys: updated.poolKeys });
-                await sweepDust(updatedInfo, updated.poolKeys, newTickLower, newTickUpper);
+                const openedPosition = await depositLiquidity(updatedInfo, updated.poolKeys, newTickLower, newTickUpper, true, undefined, { poolInfo: updatedInfo, poolKeys: updated.poolKeys });
+                await sweepDust(updatedInfo, updated.poolKeys, newTickLower, newTickUpper, openedPosition ?? undefined);
             } else {
                 const usdc = await getTokenBalance(MINT_A);
                 const usdt = await getTokenBalance(MINT_B);
                 if (usdc.add(usdt).gt(new BN(5_000_000))) {
                     await rebalanceToRatio(poolInfo, tickLower, tickUpper);
-                    await sweepDust(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper);
+                    await sweepDust(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper, myPosition);
                 } else console.log("✅ Position Healthy (Dust < $5)");
             }
         }
