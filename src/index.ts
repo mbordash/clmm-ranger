@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Connection, PublicKey, VersionedTransaction, Transaction, Keypair } from '@solana/web3.js';
+import { Connection, PublicKey, VersionedTransaction, Transaction, Keypair, ComputeBudgetProgram } from '@solana/web3.js';
 import { Raydium, TickUtils, ApiV3PoolInfoConcentratedItem, TxVersion } from '@raydium-io/raydium-sdk-v2';
 import { getAssociatedTokenAddressSync, getAccount, TOKEN_PROGRAM_ID, createAssociatedTokenAccountIdempotentInstruction } from '@solana/spl-token';
 import TransportNodeHid from "@ledgerhq/hw-transport-node-hid";
@@ -22,6 +22,22 @@ const TARGET_WALLET = process.env.WALLET_ADDRESS;   // optional in hot-wallet mo
 const LEDGER_PATH = process.env.LEDGER_PATH ?? "44'/501'";
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY; // base58 private key — set to use hot wallet instead of Ledger
 const DISABLE_RAYDIUM_TOKEN_LOAD = (process.env.DISABLE_RAYDIUM_TOKEN_LOAD ?? 'true').toLowerCase() !== 'false';
+
+// ── Priority fee / compute budget ─────────────────────────────────────────────
+// Applied to every Raydium CLMM tx (open / increase / decrease+close / reclaim).
+// Without it these txs ran at the 5000-lamport floor with zero priority, so under
+// load they failed to land (the 429s and Custom 6017/6047 in the logs) — leaving
+// half-finished re-ranges and orphaned positions whose rent (~0.0055 SOL each) is
+// then lost. A small priority fee makes the close/open pipeline land reliably.
+//
+// Per-tx priority cost ≈ PRIORITY_FEE_MICRO_LAMPORTS × COMPUTE_UNIT_LIMIT ÷ 1e15 SOL.
+//   default 50_000 µLamports/CU × 600_000 CU ≈ 0.00003 SOL/tx — cheap insurance.
+// Tune via env; set PRIORITY_FEE_MICRO_LAMPORTS=0 to disable entirely.
+const COMPUTE_UNIT_LIMIT = Number(process.env.COMPUTE_UNIT_LIMIT ?? 600_000);
+const PRIORITY_FEE_MICRO_LAMPORTS = Number(process.env.PRIORITY_FEE_MICRO_LAMPORTS ?? 50_000);
+const COMPUTE_BUDGET_CONFIG = PRIORITY_FEE_MICRO_LAMPORTS > 0
+    ? { units: COMPUTE_UNIT_LIMIT, microLamports: PRIORITY_FEE_MICRO_LAMPORTS }
+    : undefined;
 
 Decimal.set({ precision: 80, rounding: Decimal.ROUND_HALF_UP });
 
@@ -213,6 +229,7 @@ async function safeWithdrawAll(position: any) {
             useSOLBalance: false, 
             closePosition: true
         },
+        computeBudgetConfig: COMPUTE_BUDGET_CONFIG,
         txVersion: TxVersion.LEGACY
     });
     
@@ -327,9 +344,9 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
 
     console.log(`🚀 ${effectiveIsNew ? "Opening" : "Top-up"} via ${useUsdcAsBase ? "USDC" : "USDT"} (Ratio: ${R.toFixed(4)})`);
     let res;
-    if (effectiveIsNew) res = await raydium.clmm.openPositionFromBase({ poolInfo, poolKeys, tickLower, tickUpper, baseAmount, otherAmountMax: otherAmount, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, withMetadata: 'no-create', txVersion: TxVersion.LEGACY });
+    if (effectiveIsNew) res = await raydium.clmm.openPositionFromBase({ poolInfo, poolKeys, tickLower, tickUpper, baseAmount, otherAmountMax: otherAmount, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, withMetadata: 'no-create', computeBudgetConfig: COMPUTE_BUDGET_CONFIG, txVersion: TxVersion.LEGACY });
     // @ts-ignore
-    else res = await raydium.clmm.increasePositionFromBase({ poolInfo, ownerPosition: effectivePosition, baseAmount, otherAmountMax: otherAmount, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, txVersion: TxVersion.LEGACY });
+    else res = await raydium.clmm.increasePositionFromBase({ poolInfo, ownerPosition: effectivePosition, baseAmount, otherAmountMax: otherAmount, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, computeBudgetConfig: COMPUTE_BUDGET_CONFIG, txVersion: TxVersion.LEGACY });
 
     const tx = res.transaction as Transaction;
     const { blockhash } = await connection.getLatestBlockhash();
@@ -462,6 +479,15 @@ async function reclaimEmptyPositions(poolInfo: ApiV3PoolInfoConcentratedItem, po
                 poolInfo, poolKeys, ownerPosition: pos, txVersion: TxVersion.LEGACY
             });
             const tx = transaction as Transaction;
+            // closePosition() (unlike decreaseLiquidity/openPositionFromBase) does
+            // NOT apply computeBudgetConfig itself, so prepend the budget manually
+            // to give the reclaim tx the same priority.
+            if (COMPUTE_BUDGET_CONFIG) {
+                tx.instructions.unshift(
+                    ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_BUDGET_CONFIG.units }),
+                    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: COMPUTE_BUDGET_CONFIG.microLamports })
+                );
+            }
             if (atasDiffer) {
                 for (const ix of tx.instructions) {
                     for (const key of ix.keys) {
