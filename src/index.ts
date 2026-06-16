@@ -420,11 +420,76 @@ async function getActivePoolPosition(maxAttempts = 3, delayMs = 1200): Promise<a
     return null;
 }
 
+/**
+ * Reclaim SOL rent locked in EMPTY (zero-liquidity) position NFTs.
+ *
+ * Why this exists — the "missing recoupment":
+ *   getActivePoolPosition() deliberately ignores zero-liquidity positions, so any
+ *   NFT left behind when the atomic close half of a re-range fails (RPC 429s,
+ *   Custom 6017/6047/6001, or a duplicate-position event — all visible in the
+ *   logs) is NEVER closed again by the bot. Each orphan keeps ~0.0055 SOL of rent
+ *   (NFT token account + personalPosition PDA) locked forever. Manually on Raydium
+ *   you'd just click "Close Position" and get it back; the bot never did.
+ *
+ * This only ever touches positions whose liquidity is exactly zero, so it cannot
+ * affect an active 1-tick position. Safe to run every loop; it sends a tx only
+ * when an orphan actually exists.
+ */
+async function reclaimEmptyPositions(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any) {
+    let positions: any[];
+    try {
+        positions = await raydium.clmm.getOwnerPositionInfo({ programId: ACTUAL_PROGRAM_ID });
+    } catch (e: any) {
+        console.warn('reclaimEmptyPositions: could not fetch positions:', e.message);
+        return;
+    }
+    const empties = positions.filter(p => p.poolId.equals(POOL_ID) && p.liquidity.isZero());
+    if (empties.length === 0) return;
+
+    console.log(`🧯 Reclaiming ${empties.length} empty position NFT(s) holding locked SOL rent...`);
+    for (const pos of empties) {
+        try {
+            // Mirror safeWithdrawAll's NFT token-program handling so the close
+            // works whether the position NFT is a legacy SPL or Token-2022 mint.
+            const nftMintInfo = await connection.getAccountInfo(pos.nftMint);
+            const nftTokenProgram: PublicKey = nftMintInfo?.owner ?? TOKEN_PROGRAM_ID;
+            const sdkNftAta = getAssociatedTokenAddressSync(pos.nftMint, walletAddress, false, TOKEN_PROGRAM_ID);
+            const correctNftAta = getAssociatedTokenAddressSync(pos.nftMint, walletAddress, false, nftTokenProgram);
+            const atasDiffer = !correctNftAta.equals(sdkNftAta);
+
+            // @ts-ignore
+            const { transaction } = await raydium.clmm.closePosition({
+                poolInfo, poolKeys, ownerPosition: pos, txVersion: TxVersion.LEGACY
+            });
+            const tx = transaction as Transaction;
+            if (atasDiffer) {
+                for (const ix of tx.instructions) {
+                    for (const key of ix.keys) {
+                        if (key.pubkey.equals(sdkNftAta)) key.pubkey = correctNftAta;
+                        if (key.pubkey.equals(TOKEN_PROGRAM_ID) && !nftTokenProgram.equals(TOKEN_PROGRAM_ID)) {
+                            key.pubkey = nftTokenProgram;
+                        }
+                    }
+                }
+            }
+            const tag = pos.nftMint?.toBase58?.().slice(0, 4) ?? 'pos';
+            await sendAndConfirm(tx, `Reclaim empty position ${tag}`);
+        } catch (e: any) {
+            // A leftover position that still has unclaimed fees can reject a bare
+            // close; skip it rather than abort the loop.
+            console.warn(`⚠️ Could not reclaim empty position ${pos.nftMint?.toBase58?.() ?? ''}: ${e.message}`);
+        }
+    }
+}
+
 async function mainLoop() {
     try {
         console.log('\n--- Loop ---');
         const poolInfoRaw = await raydium.clmm.getPoolInfoFromRpc(POOL_ID.toBase58());
         const poolInfo = poolInfoRaw.poolInfo;
+        // Reclaim SOL from any empty position NFTs left behind by a failed close.
+        // No-op (single RPC read) when there are none.
+        await reclaimEmptyPositions(poolInfo, poolInfoRaw.poolKeys);
         // Use aggressive retries here so slow RPC nodes don't mistakenly report
         // "no position" after a recent open and trigger a duplicate.
         const myPosition = await getActivePoolPosition(8, 2000);
