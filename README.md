@@ -10,7 +10,7 @@ The bot monitors a concentrated-liquidity pool and keeps your position in the ti
 
 ### ✨ Smart Dust Top-Up
 
-When the position is already in range and centered, the bot checks for any undeposited token dust sitting in the wallet. If the combined value exceeds **$5**, it automatically rebalances the dust to the correct ratio for the existing tick range and calls `increaseLiquidity` — no position close/reopen required. This keeps idle capital working without the overhead of burning and re-minting the position NFT.
+When the position is already in range and centered, the bot checks for any undeposited token dust sitting in the wallet. If the combined value exceeds `DUST_THRESHOLD_USD` (default **$50**), it automatically rebalances the dust to the correct ratio for the existing tick range and calls `increaseLiquidity` — no position close/reopen required. This keeps idle capital working without the overhead of burning and re-minting the position NFT. Raising the threshold avoids spending more in swap/top-up fees than the leftover dust is worth.
 
 Designed for stablecoin pairs (e.g. USDC/USDT) but works with any Raydium CLMM pool.
 
@@ -38,7 +38,12 @@ Edit `.env` with your values:
 | `RPC_URL` | Solana RPC endpoint (with API key) |
 | `POOL_ID` | Raydium CLMM pool to manage |
 | `MINT_A` / `MINT_B` | Token mints (defaults to USDC/USDT) |
-| `CHECK_INTERVAL_MS` | Poll interval in ms |
+| `CHECK_INTERVAL_MS` | Poll interval in ms (default `120000`) |
+| `DUST_THRESHOLD_USD` | Min leftover wallet value (USD) worth re-depositing; below this the bot stops sweeping (default `50`) |
+| `REBALANCE_RESIDUAL_USD` | Min wallet imbalance (USD) before firing a Jupiter rebalance swap; below this is "close enough" (default `1.0`) |
+| `MIN_SOL_LAMPORTS` | Min wallet SOL (lamports) required to start a re-range; below this the loop skips mutating actions (default `35000000` = 0.035 SOL) |
+| `PRIORITY_FEE_MICRO_LAMPORTS` | Priority fee per compute unit applied to every Raydium CLMM tx; set `0` to disable (default `50000`) |
+| `COMPUTE_UNIT_LIMIT` | Compute-unit limit paired with the priority fee (default `600000`) |
 | `WALLET_PRIVATE_KEY` | **Hot wallet mode** (base58 64-byte secret key). If set, this mode is used |
 | `WALLET_ADDRESS` | **Ledger mode** safety check (recommended) |
 | `LEDGER_PATH` | **Ledger mode** derivation path (default `44'/501'`) |
@@ -148,8 +153,11 @@ The bot will:
 - Uses the **Raydium SDK v2** for CLMM position management
 - Uses the **Jupiter Swap API** for token rebalancing
 - Computes the mathematically optimal token ratio using the concentrated-liquidity formula
-- Iteratively swaps until the residual imbalance is below the configured threshold
+- Iteratively swaps until the residual imbalance is below `REBALANCE_RESIDUAL_USD`
 - Tops up existing in-range positions with idle wallet dust via `increaseLiquidity` (no re-open needed)
+- Reclaims locked rent (~0.0055 SOL each) from any empty position NFTs left behind by a previously failed close
+- Applies a configurable priority fee / compute budget to every CLMM tx so the close→open pipeline lands atomically and doesn't strand orphaned positions
+- Skips re-ranging when wallet SOL drops below `MIN_SOL_LAMPORTS`, avoiding a half-open position after running out of gas mid-cycle
 - Includes workarounds for Raydium SDK bugs (reward account derivation, Token-2022 NFT ATA patching)
 
 ## ⚠️ Disclaimer

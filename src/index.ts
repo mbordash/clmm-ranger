@@ -17,7 +17,11 @@ const MINT_B = new PublicKey(process.env.MINT_B ?? 'Es9vMFrzaCERmJfrF4H2FYD4KCoN
 const POOL_ID = new PublicKey(process.env.POOL_ID!);
 const ACTUAL_PROGRAM_ID = new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK');
 
-const CHECK_INTERVAL_MS = 120_000;
+const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS ?? 120_000);
+// Minimum wallet SOL (lamports) required to safely start a re-range. Below this
+// the loop skips mutating actions so we never get stuck with a half-open
+// position after running out of gas mid-cycle. Default 0.035 SOL.
+const MIN_SOL_LAMPORTS = Number(process.env.MIN_SOL_LAMPORTS ?? 35_000_000);
 const TARGET_WALLET = process.env.WALLET_ADDRESS;   // optional in hot-wallet mode
 const LEDGER_PATH = process.env.LEDGER_PATH ?? "44'/501'";
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY; // base58 private key — set to use hot wallet instead of Ledger
@@ -35,6 +39,16 @@ const DISABLE_RAYDIUM_TOKEN_LOAD = (process.env.DISABLE_RAYDIUM_TOKEN_LOAD ?? 't
 // Tune via env; set PRIORITY_FEE_MICRO_LAMPORTS=0 to disable entirely.
 const COMPUTE_UNIT_LIMIT = Number(process.env.COMPUTE_UNIT_LIMIT ?? 600_000);
 const PRIORITY_FEE_MICRO_LAMPORTS = Number(process.env.PRIORITY_FEE_MICRO_LAMPORTS ?? 50_000);
+// Minimum leftover wallet value (in USD) worth re-depositing. Below this, the
+// bot stops sweeping so it doesn't spend more in swap + top-up fees than the
+// dust is worth. Raised from $5 to reduce deep-iteration fee churn.
+const DUST_THRESHOLD_USD = Number(process.env.DUST_THRESHOLD_USD ?? 50);
+const DUST_THRESHOLD_RAW = new BN(Math.round(DUST_THRESHOLD_USD * 1_000_000)); // stablecoin 6-decimals
+// Minimum wallet imbalance (USD) before firing a Jupiter rebalance swap. Below
+// this, the wallet is "close enough" and we skip the swap to save fees.
+// Previously hardcoded at $0.10 — far too aggressive for a $15k position.
+const REBALANCE_RESIDUAL_USD = Number(process.env.REBALANCE_RESIDUAL_USD ?? 1.0);
+const REBALANCE_RESIDUAL_RAW = new BN(Math.round(REBALANCE_RESIDUAL_USD * 1_000_000));
 const COMPUTE_BUDGET_CONFIG = PRIORITY_FEE_MICRO_LAMPORTS > 0
     ? { units: COMPUTE_UNIT_LIMIT, microLamports: PRIORITY_FEE_MICRO_LAMPORTS }
     : undefined;
@@ -274,7 +288,7 @@ async function rebalanceToRatio(poolInfo: ApiV3PoolInfoConcentratedItem, tickLow
 
     console.log(`⚖️ Wallet: USDC ${(usdcBal.toNumber()/1e6).toFixed(2)}, USDT ${(usdtBal.toNumber()/1e6).toFixed(2)}`);
     const diffUsdc = new Decimal(usdcBal.toString()).sub(targetUsdc);
-    if (diffUsdc.abs().gt(100_000)) { 
+    if (diffUsdc.abs().gt(REBALANCE_RESIDUAL_RAW.toString())) {
         console.log(`🔄 Rebalancing: ${diffUsdc.gt(0) ? "Selling USDC for USDT" : "Selling USDT for USDC"}`);
         const swapTx = diffUsdc.gt(0) ? await getJupiterSwapTx(MINT_A, MINT_B, diffUsdc.toFixed(0)) : await getJupiterSwapTx(MINT_B, MINT_A, new Decimal(usdtBal.toString()).sub(targetUsdt).toFixed(0));
         if (swapTx) { await sendAndConfirm(swapTx, "Jupiter Rebalance Swap"); await new Promise(r => setTimeout(r, 2000)); await raydium.account.fetchWalletTokenAccounts(); }
@@ -374,8 +388,8 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
 }
 
 /**
- * Repeatedly top-up the active position until wallet dust drops below $5.
- * Each call to depositLiquidity deposits 95% of the dominant token; this loop
+ * Repeatedly top-up the active position until wallet dust drops below
+ * DUST_THRESHOLD_USD (default $50). Each call to depositLiquidity deposits 95% of the dominant token; this loop
  * runs immediately (no inter-loop wait) until the remainder is negligible.
  * Capped at 2 rounds to prevent burning more in fees than the dust is worth.
  *
@@ -389,7 +403,7 @@ async function sweepDust(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any,
         const usdc = await getTokenBalance(MINT_A);
         const usdt = await getTokenBalance(MINT_B);
         const totalDust = usdc.add(usdt);
-        if (totalDust.lte(new BN(5_000_000))) {
+        if (totalDust.lte(DUST_THRESHOLD_RAW)) {
             if (round > 0) console.log("✅ Dust cleared.");
             return;
         }
@@ -516,6 +530,16 @@ async function mainLoop() {
         // Reclaim SOL from any empty position NFTs left behind by a failed close.
         // No-op (single RPC read) when there are none.
         await reclaimEmptyPositions(poolInfo, poolInfoRaw.poolKeys);
+        // ── Low-SOL safety guard ─────────────────────────────────────────────
+        // Re-ranging is a multi-tx close+open pipeline; if we run out of gas
+        // mid-cycle we can be left with a withdrawn-but-not-reopened position.
+        // Reclaim above can only ADD SOL, so we check the balance after it.
+        const solBalance = await connection.getBalance(walletAddress);
+        if (solBalance < MIN_SOL_LAMPORTS) {
+            console.warn(`⛽ Low SOL: ${(solBalance / 1e9).toFixed(4)} SOL < ${(MIN_SOL_LAMPORTS / 1e9).toFixed(4)} SOL minimum — skipping re-range/deposit this loop. Top up the wallet.`);
+            return;
+        }
+        // ─────────────────────────────────────────────────────────────────────
         // Use aggressive retries here so slow RPC nodes don't mistakenly report
         // "no position" after a recent open and trigger a duplicate.
         const myPosition = await getActivePoolPosition(8, 2000);
@@ -562,10 +586,10 @@ async function mainLoop() {
             } else {
                 const usdc = await getTokenBalance(MINT_A);
                 const usdt = await getTokenBalance(MINT_B);
-                if (usdc.add(usdt).gt(new BN(5_000_000))) {
+                if (usdc.add(usdt).gt(DUST_THRESHOLD_RAW)) {
                     await rebalanceToRatio(poolInfo, tickLower, tickUpper);
                     await sweepDust(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper, myPosition);
-                } else console.log("✅ Position Healthy (Dust < $5)");
+                } else console.log(`✅ Position Healthy (Dust < $${DUST_THRESHOLD_USD})`);
             }
         }
     } catch (e: any) { console.error('Loop Error:', e.message); }
