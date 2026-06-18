@@ -40,6 +40,7 @@ Edit `.env` with your values:
 | `MINT_A` / `MINT_B` | Token mints (defaults to USDC/USDT) |
 | `CHECK_INTERVAL_MS` | Poll interval in ms (default `120000`) |
 | `DUST_THRESHOLD_USD` | Min leftover wallet value (USD) worth re-depositing; below this the bot stops sweeping (default `50`) |
+| `BASE_DEPOSIT_PCT` | Percent of the dominant token deposited per round; the rest is a slippage cushion vs error 6021. Higher = more capital deployed (default `95`; try `99` for stable 1-tick pairs) |
 | `REBALANCE_RESIDUAL_USD` | Min wallet imbalance (USD) before firing a Jupiter rebalance swap; below this is "close enough" (default `1.0`) |
 | `MIN_SOL_LAMPORTS` | Min wallet SOL (lamports) required to start a re-range; below this the loop skips mutating actions (default `35000000` = 0.035 SOL) |
 | `PRIORITY_FEE_MICRO_LAMPORTS` | Priority fee per compute unit applied to every Raydium CLMM tx; set `0` to disable (default `50000`) |

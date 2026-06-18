@@ -49,6 +49,11 @@ const DUST_THRESHOLD_RAW = new BN(Math.round(DUST_THRESHOLD_USD * 1_000_000)); /
 // Previously hardcoded at $0.10 — far too aggressive for a $15k position.
 const REBALANCE_RESIDUAL_USD = Number(process.env.REBALANCE_RESIDUAL_USD ?? 1.0);
 const REBALANCE_RESIDUAL_RAW = new BN(Math.round(REBALANCE_RESIDUAL_USD * 1_000_000));
+// Percentage of the dominant ("base") token deposited each round. The remainder
+// is a slippage cushion against Raydium error 6021 (PriceSlippageCheck). For a
+// 1-tick stable pair (USDC/USDT) price barely moves, so a high value (e.g. 99)
+// deploys more capital safely. Lower it if you see 6021 errors on a volatile pool.
+const BASE_DEPOSIT_PCT = Math.min(100, Math.max(1, Number(process.env.BASE_DEPOSIT_PCT ?? 95)));
 const COMPUTE_BUDGET_CONFIG = PRIORITY_FEE_MICRO_LAMPORTS > 0
     ? { units: COMPUTE_UNIT_LIMIT, microLamports: PRIORITY_FEE_MICRO_LAMPORTS }
     : undefined;
@@ -353,7 +358,7 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
     const rawBase  = useUsdcAsBase ? usdcBal : usdtBal;
     const rawOther = useUsdcAsBase ? usdtBal : usdcBal;
 
-    const baseAmount  = rawBase.mul(new BN(95)).div(new BN(100));
+    const baseAmount  = rawBase.mul(new BN(BASE_DEPOSIT_PCT)).div(new BN(100));
     const otherAmount = rawOther; // full balance — never a binding constraint
 
     console.log(`🚀 ${effectiveIsNew ? "Opening" : "Top-up"} via ${useUsdcAsBase ? "USDC" : "USDT"} (Ratio: ${R.toFixed(4)})`);
