@@ -527,6 +527,21 @@ async function reclaimEmptyPositions(poolInfo: ApiV3PoolInfoConcentratedItem, po
     }
 }
 
+/**
+ * Compute a spacing-aligned [tickLower, tickUpper) band `POSITION_WIDTH_SPACINGS`
+ * spacings wide, centred on the tick that currently contains the price. For
+ * width 1 this is identical to the original single-tick behaviour. For width 2
+ * the price sits mid-band so it has room to move either direction before going
+ * out of range.
+ */
+function computeRange(tickCurrent: number, tickSpacing: number) {
+    const base = Math.floor(tickCurrent / tickSpacing) * tickSpacing;
+    const halfBelow = Math.floor(POSITION_WIDTH_SPACINGS / 2);
+    const tickLower = base - halfBelow * tickSpacing;
+    const tickUpper = tickLower + POSITION_WIDTH_SPACINGS * tickSpacing;
+    return { tickLower, tickUpper };
+}
+
 async function mainLoop() {
     try {
         console.log('\n--- Loop ---');
@@ -551,8 +566,16 @@ async function mainLoop() {
         // @ts-ignore
         const tickCurrent = poolInfo.tickCurrent ?? 0;
         const tickSpacing = poolInfo.config.tickSpacing;
-        const tickLower = Math.floor(tickCurrent / tickSpacing) * tickSpacing;
-        const tickUpper = tickLower + tickSpacing;
+        const { tickLower, tickUpper } = computeRange(tickCurrent, tickSpacing);
+        // Make the range behaviour explicit in every loop so re-range decisions
+        // are auditable from the logs.
+        const inBand = myPosition
+            ? (tickCurrent >= myPosition.tickLower && tickCurrent < myPosition.tickUpper)
+            : null;
+        console.log(
+            `📊 tick ${tickCurrent} | spacing ${tickSpacing} | width ${POSITION_WIDTH_SPACINGS} | target band [${tickLower}, ${tickUpper})` +
+            (myPosition ? ` | my band [${myPosition.tickLower}, ${myPosition.tickUpper}) ${inBand ? '✅ in range' : '⚠️ OUT of range'}` : ' | no active position')
+        );
 
         if (!myPosition) {
             // ── Duplicate-open guard ─────────────────────────────────────────────
@@ -572,8 +595,14 @@ async function mainLoop() {
             // re-query when the RPC is still slow to index.
             await sweepDust(poolInfo, poolInfoRaw.poolKeys, tickLower, tickUpper, openedPosition ?? undefined);
         } else {
-            if (myPosition.tickLower !== tickLower) {
-                console.log("🔁 Out of range, re-ranging...");
+            // Re-range only when the price has actually LEFT our band, not merely
+            // moved to a different tick inside it. For a 1-spacing width this is
+            // equivalent to the old `tickLower !== ...` check; for a wider band it
+            // prevents needless re-ranges (and full-position Jupiter swaps) while
+            // the price is still earning fees inside the range.
+            const outOfRange = tickCurrent < myPosition.tickLower || tickCurrent >= myPosition.tickUpper;
+            if (outOfRange) {
+                console.log(`🔁 Out of range (tick ${tickCurrent} not in [${myPosition.tickLower}, ${myPosition.tickUpper})), re-ranging...`);
                 // Clear the open-guard timestamp: we are about to close this
                 // position and open a fresh one, so the guard must not block it.
                 lastConfirmedOpenAt = 0;
@@ -583,8 +612,7 @@ async function mainLoop() {
                 // @ts-ignore
                 const newTick = updatedInfo.tickCurrent ?? 0;
                 const newTickSpacing = updatedInfo.config.tickSpacing;
-                const newTickLower = Math.floor(newTick / newTickSpacing) * newTickSpacing;
-                const newTickUpper = newTickLower + newTickSpacing;
+                const { tickLower: newTickLower, tickUpper: newTickUpper } = computeRange(newTick, newTickSpacing);
                 await rebalanceToRatio(updatedInfo, newTickLower, newTickUpper);
                 const openedPosition = await depositLiquidity(updatedInfo, updated.poolKeys, newTickLower, newTickUpper, true, undefined, { poolInfo: updatedInfo, poolKeys: updated.poolKeys });
                 await sweepDust(updatedInfo, updated.poolKeys, newTickLower, newTickUpper, openedPosition ?? undefined);
@@ -602,6 +630,17 @@ async function mainLoop() {
 
 async function startBot() {
     await initRaydium();
+    // One-time config banner so deployed settings are visible at the top of logs.
+    console.log(
+        '⚙️ Config: ' +
+        `width=${POSITION_WIDTH_SPACINGS} spacing(s) | ` +
+        `interval=${(CHECK_INTERVAL_MS / 1000).toFixed(0)}s | ` +
+        `baseDeposit=${BASE_DEPOSIT_PCT}% | ` +
+        `dust<$${DUST_THRESHOLD_USD} | ` +
+        `rebalance>$${REBALANCE_RESIDUAL_USD} | ` +
+        `minSOL=${(MIN_SOL_LAMPORTS / 1e9).toFixed(4)} | ` +
+        `priorityFee=${PRIORITY_FEE_MICRO_LAMPORTS}µL/CU × ${COMPUTE_UNIT_LIMIT}CU`
+    );
     while (true) {
         const loopStart = Date.now();
         await mainLoop();
