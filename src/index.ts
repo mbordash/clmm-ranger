@@ -54,6 +54,11 @@ const REBALANCE_RESIDUAL_RAW = new BN(Math.round(REBALANCE_RESIDUAL_USD * 1_000_
 // 1-tick stable pair (USDC/USDT) price barely moves, so a high value (e.g. 99)
 // deploys more capital safely. Lower it if you see 6021 errors on a volatile pool.
 const BASE_DEPOSIT_PCT = Math.min(100, Math.max(1, Number(process.env.BASE_DEPOSIT_PCT ?? 95)));
+// Width of the LP position, measured in tick-spacings. 1 = the original single-tick
+// range (max APR, but re-ranges on every tick crossing and round-trips the whole
+// position through Jupiter each time). A wider band (e.g. 2) re-ranges less often AND
+// swaps less per re-range, because a band straddling the price holds both tokens.
+const POSITION_WIDTH_SPACINGS = Math.max(1, Math.floor(Number(process.env.POSITION_WIDTH_SPACINGS ?? 1)));
 const COMPUTE_BUDGET_CONFIG = PRIORITY_FEE_MICRO_LAMPORTS > 0
     ? { units: COMPUTE_UNIT_LIMIT, microLamports: PRIORITY_FEE_MICRO_LAMPORTS }
     : undefined;
