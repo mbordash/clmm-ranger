@@ -14,6 +14,16 @@ When the position is already in range and centered, the bot checks for any undep
 
 Designed for stablecoin pairs (e.g. USDC/USDT) but works with any Raydium CLMM pool.
 
+### 🧯 Storm Protection
+
+During a volatile/depeg episode the price can whipsaw across your band many times in minutes. Without guards, the bot would close + Jupiter-swap + reopen the **whole** position on every crossing — bleeding slippage on each round-trip. Three guards cap that:
+
+1. **Re-range cooldown** — after a re-range, the bot holds for `RERANGE_COOLDOWN_MS` before re-ranging again, *unless* the price has moved `RERANGE_FAR_TICKS` past the band (a genuine trend worth following, not a wiggle to chase).
+2. **Volatility circuit-breaker** — if `RERANGE_BURST_LIMIT` re-ranges happen within `RERANGE_BURST_WINDOW_MS`, the bot stops re-ranging entirely for `RERANGE_CIRCUIT_PAUSE_MS` and simply holds the position — it stops swapping capital back and forth into a moving price.
+3. **Tighter Jupiter slippage** — normal rebalance swaps quote at `JUPITER_SLIPPAGE_BPS` (default 5 bps) so a high-impact route is refused rather than filled, with a one-shot widen to `JUPITER_SLIPPAGE_FALLBACK_BPS` only if the tight quote can't route.
+
+Single-sided opens (price at/outside the band) are also handled explicitly rather than via an infinity ratio sentinel, which removes a class of `6047/6017` open failures.
+
 ## Requirements
 
 - **Node.js** ≥ 18
@@ -39,6 +49,13 @@ Edit `.env` with your values:
 | `POOL_ID` | Raydium CLMM pool to manage |
 | `MINT_A` / `MINT_B` | Token mints (defaults to USDC/USDT) |
 | `CHECK_INTERVAL_MS` | Poll interval in ms (default `120000`) |
+| `POSITION_WIDTH_SPACINGS` | LP width in tick-spacings (default `3`). Wider bands re-range less and swap a smaller fraction per re-range, cutting slippage during volatility. `1` = single-tick max-APR mode |
+| `JUPITER_SLIPPAGE_BPS` | Tight slippage cap for normal rebalance swaps (default `5`). High-price-impact routes are refused, not filled |
+| `JUPITER_SLIPPAGE_FALLBACK_BPS` | Wider cap used only if the tight quote can't route (default `20`) |
+| `RERANGE_COOLDOWN_MS` | After a re-range, wait this long before re-ranging again (default `1200000` = 20 min) unless price runs far past the band |
+| `RERANGE_FAR_TICKS` | Ticks past the band edge that override the cooldown — a genuine move worth following (default `3`) |
+| `RERANGE_BURST_LIMIT` / `RERANGE_BURST_WINDOW_MS` | Circuit breaker: this many re-ranges within this window trips a pause (defaults `3` / `900000` = 15 min) |
+| `RERANGE_CIRCUIT_PAUSE_MS` | How long the circuit breaker holds the position without re-ranging (default `3600000` = 60 min) |
 | `DUST_THRESHOLD_USD` | Min leftover wallet value (USD) worth re-depositing; below this the bot stops sweeping (default `50`) |
 | `BASE_DEPOSIT_PCT` | Percent of the dominant token deposited per round; the rest is a slippage cushion vs error 6021. Higher = more capital deployed (default `95`; try `99` for stable 1-tick pairs) |
 | `REBALANCE_RESIDUAL_USD` | Min wallet imbalance (USD) before firing a Jupiter rebalance swap; below this is "close enough" (default `1.0`) |

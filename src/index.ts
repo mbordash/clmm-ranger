@@ -58,10 +58,38 @@ const BASE_DEPOSIT_PCT = Math.min(100, Math.max(1, Number(process.env.BASE_DEPOS
 // range (max APR, but re-ranges on every tick crossing and round-trips the whole
 // position through Jupiter each time). A wider band (e.g. 2) re-ranges less often AND
 // swaps less per re-range, because a band straddling the price holds both tokens.
-const POSITION_WIDTH_SPACINGS = Math.max(1, Math.floor(Number(process.env.POSITION_WIDTH_SPACINGS ?? 1)));
+const POSITION_WIDTH_SPACINGS = Math.max(1, Math.floor(Number(process.env.POSITION_WIDTH_SPACINGS ?? 3)));
 const COMPUTE_BUDGET_CONFIG = PRIORITY_FEE_MICRO_LAMPORTS > 0
     ? { units: COMPUTE_UNIT_LIMIT, microLamports: PRIORITY_FEE_MICRO_LAMPORTS }
     : undefined;
+
+// ── Jupiter slippage (tighter normal-ops cap + retry) ─────────────────────────
+// The old hardcoded 20 bps cap let Jupiter fill a $15k stable swap at up to
+// 0.20% adverse price — and during the re-range "storm" we fired ~8 of those
+// back-to-back, which is most of where the $10 went. We now quote at a TIGHT
+// cap first (default 5 bps) so a high-price-impact route is simply refused, and
+// only fall back to a wider cap if the tight quote can't route at all.
+const JUPITER_SLIPPAGE_BPS = Number(process.env.JUPITER_SLIPPAGE_BPS ?? 5);
+const JUPITER_SLIPPAGE_FALLBACK_BPS = Number(process.env.JUPITER_SLIPPAGE_FALLBACK_BPS ?? 20);
+
+// ── Re-range cooldown + volatility circuit-breaker ────────────────────────────
+// The storm wasn't one bad event, it was a CASCADE: price whipsawed across the
+// band ~8 times and the bot round-tripped the whole position through Jupiter on
+// every crossing. Two guards stop the bleed:
+//
+//   1. COOLDOWN — after a re-range, refuse to re-range again for a window
+//      (default 20 min) UNLESS the price has run far past the band edge
+//      (RERANGE_FAR_TICKS), which signals a genuine directional move worth
+//      following rather than a 1-tick wiggle to chase.
+//   2. CIRCUIT BREAKER — if RERANGE_BURST_LIMIT re-ranges happen within
+//      RERANGE_BURST_WINDOW_MS, stop re-ranging entirely for
+//      RERANGE_CIRCUIT_PAUSE_MS. During the pause we HOLD the position (no
+//      swaps) so we stop selling $15k back and forth into a moving price.
+const RERANGE_COOLDOWN_MS = Number(process.env.RERANGE_COOLDOWN_MS ?? 20 * 60_000);
+const RERANGE_FAR_TICKS = Number(process.env.RERANGE_FAR_TICKS ?? 3);
+const RERANGE_BURST_LIMIT = Number(process.env.RERANGE_BURST_LIMIT ?? 3);
+const RERANGE_BURST_WINDOW_MS = Number(process.env.RERANGE_BURST_WINDOW_MS ?? 15 * 60_000);
+const RERANGE_CIRCUIT_PAUSE_MS = Number(process.env.RERANGE_CIRCUIT_PAUSE_MS ?? 60 * 60_000);
 
 Decimal.set({ precision: 80, rounding: Decimal.ROUND_HALF_UP });
 
@@ -77,6 +105,15 @@ let ledgerSigner: any; // aliased to signer below for backward compat
 // myPosition=null and opens a SECOND position, burning SOL on duplicate rent.
 let lastConfirmedOpenAt = 0;       // epoch ms — 0 means "never"
 const OPEN_GUARD_MS = 5 * 60_000; // 5 minutes — safe margin for any RPC lag
+
+// ── Re-range cooldown / circuit-breaker state ─────────────────────────────────
+// lastRerangeAt: epoch ms of the most recent completed re-range (0 = never).
+// rerangeTimestamps: rolling log of recent re-range times, pruned to the burst
+//   window, used to detect a volatility cascade.
+// circuitBreakerUntil: epoch ms until which ALL re-ranges are suppressed.
+let lastRerangeAt = 0;
+const rerangeTimestamps: number[] = [];
+let circuitBreakerUntil = 0;
 
 async function getHotWalletSigner(privateKeyB58: string) {
     const keypair = Keypair.fromSecretKey(bs58.decode(privateKeyB58));
@@ -181,11 +218,25 @@ async function getTokenBalance(mint: PublicKey): Promise<BN> {
 }
 
 async function getJupiterSwapTx(inputMint: PublicKey, outputMint: PublicKey, amount: string): Promise<VersionedTransaction | null> {
-    try {
-        const { data: quoteResponse } = await axios.get(`https://api.jup.ag/swap/v1/quote?inputMint=${inputMint.toBase58()}&outputMint=${outputMint.toBase58()}&amount=${amount}&slippageBps=20`);
-        const { data: { swapTransaction } } = await axios.post('https://api.jup.ag/swap/v1/swap', { quoteResponse, userPublicKey: walletAddress.toString(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: false, prioritizationFeeLamports: "auto" });
-        return VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
-    } catch (e) { return null; }
+    // Quote at the TIGHT cap first; only widen if the tight quote can't route.
+    // De-dupe so we don't make two identical requests when the caps are equal.
+    const bpsLadder = JUPITER_SLIPPAGE_FALLBACK_BPS > JUPITER_SLIPPAGE_BPS
+        ? [JUPITER_SLIPPAGE_BPS, JUPITER_SLIPPAGE_FALLBACK_BPS]
+        : [JUPITER_SLIPPAGE_BPS];
+    for (let i = 0; i < bpsLadder.length; i++) {
+        const slippageBps = bpsLadder[i];
+        try {
+            const { data: quoteResponse } = await axios.get(`https://api.jup.ag/swap/v1/quote?inputMint=${inputMint.toBase58()}&outputMint=${outputMint.toBase58()}&amount=${amount}&slippageBps=${slippageBps}`);
+            const { data: { swapTransaction } } = await axios.post('https://api.jup.ag/swap/v1/swap', { quoteResponse, userPublicKey: walletAddress.toString(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: false, prioritizationFeeLamports: "auto" });
+            if (i > 0) console.log(`↪️ Jupiter quote used fallback slippage ${slippageBps} bps (tight ${JUPITER_SLIPPAGE_BPS} bps could not route).`);
+            return VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
+        } catch (e) {
+            // Tight quote failed — try the next (wider) cap. If this was already the
+            // widest, give up (caller treats null as "skip swap this round").
+            if (i === bpsLadder.length - 1) return null;
+        }
+    }
+    return null;
 }
 
 async function sendAndConfirm(tx: Transaction | VersionedTransaction, label: string) {
@@ -213,9 +264,26 @@ async function sendAndConfirm(tx: Transaction | VersionedTransaction, label: str
     
     const result = await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');
     if (result.value.err) throw new Error(`TX Failed: ${JSON.stringify(result.value.err)}`);
-    
-    const endBal = await connection.getBalance(walletAddress);
-    const diff = (startBal - endBal) / 1e9;
+
+    // Compute the exact SOL delta from the CONFIRMED transaction's own pre/post
+    // balances for the fee payer (account index 0 is always the fee payer). This
+    // avoids the getBalance() race where a 'confirmed' read could land on a slot
+    // BEFORE the tx was applied, which previously mis-logged rent-recovering
+    // closes as a phantom "0.000000 SOL". Falls back to a 'finalized' balance
+    // read if the tx meta isn't available yet.
+    let diff: number;
+    try {
+        const txInfo = await connection.getTransaction(signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+        if (txInfo?.meta) {
+            diff = (txInfo.meta.preBalances[0] - txInfo.meta.postBalances[0]) / 1e9;
+        } else {
+            const endBal = await connection.getBalance(walletAddress, 'finalized');
+            diff = (startBal - endBal) / 1e9;
+        }
+    } catch {
+        const endBal = await connection.getBalance(walletAddress, 'finalized');
+        diff = (startBal - endBal) / 1e9;
+    }
     console.log(`💸 [${label}] Net SOL Change: ${diff.toFixed(6)} SOL`);
     return signature;
 }
@@ -273,30 +341,56 @@ async function safeWithdrawAll(position: any) {
     await sendAndConfirm(tx, "Atomic Withdraw & Full Rent Recovery");
 }
 
-async function getRatioMath(poolInfo: ApiV3PoolInfoConcentratedItem, tickLower: number, tickUpper: number) {
+async function getRatioMath(poolInfo: ApiV3PoolInfoConcentratedItem, tickLower: number, tickUpper: number): Promise<{ R: Decimal | null, price: Decimal, singleSided: 'A' | 'B' | null }> {
     // @ts-ignore
     const sP = new Decimal(poolInfo.sqrtPriceX64.toString());
     const sPa = new Decimal(TickUtils.getTickPrice({ poolInfo, tick: tickLower, baseIn: true }).tickSqrtPriceX64.toString());
     const sPb = new Decimal(TickUtils.getTickPrice({ poolInfo, tick: tickUpper, baseIn: true }).tickSqrtPriceX64.toString());
     const Q64 = new Decimal(2).pow(64);
     const price = new Decimal(poolInfo.price);
-    let R: Decimal;
-    if (sP.lte(sPa)) R = new Decimal(1e18); 
-    else if (sP.gte(sPb)) R = new Decimal(0);
-    else R = sPb.sub(sP).mul(Q64).mul(Q64).div(sP.mul(sPb).mul(sP.sub(sPa)));
-    return { R, price };
+    // Single-sided cases are returned EXPLICITLY instead of via an infinity
+    // sentinel (the old R=1e18). Carrying 1e18 through the rebalance/deposit math
+    // produced fragile near-overflow arithmetic and mislabelled single-sided
+    // opens (the `Ratio: 1000000000000000000.0000` lines in the storm log that
+    // accompanied the 6047/6017 failures).
+    //   price at/below lower tick → position is 100% MintA (USDC)  → singleSided 'A'
+    //   price at/above upper tick → position is 100% MintB (USDT)  → singleSided 'B'
+    if (sP.lte(sPa)) return { R: null, price, singleSided: 'A' };
+    if (sP.gte(sPb)) return { R: null, price, singleSided: 'B' };
+    const R = sPb.sub(sP).mul(Q64).mul(Q64).div(sP.mul(sPb).mul(sP.sub(sPa)));
+    return { R, price, singleSided: null };
 }
 
 async function rebalanceToRatio(poolInfo: ApiV3PoolInfoConcentratedItem, tickLower: number, tickUpper: number) {
-    const { R, price } = await getRatioMath(poolInfo, tickLower, tickUpper);
+    const { R, price, singleSided } = await getRatioMath(poolInfo, tickLower, tickUpper);
     await raydium.account.fetchWalletTokenAccounts();
     const usdcBal = await getTokenBalance(MINT_A);
     const usdtBal = await getTokenBalance(MINT_B);
-    const totalUsdcVal = new Decimal(usdcBal.toString()).add(new Decimal(usdtBal.toString()).div(price));
-    const targetUsdt = totalUsdcVal.div(R.add(new Decimal(1).div(price)));
-    const targetUsdc = R.mul(targetUsdt);
-
     console.log(`⚖️ Wallet: USDC ${(usdcBal.toNumber()/1e6).toFixed(2)}, USDT ${(usdtBal.toNumber()/1e6).toFixed(2)}`);
+
+    // ── Single-sided: target is 100% of one token, so sell the entire other side.
+    if (singleSided === 'A') {
+        if (usdtBal.gt(REBALANCE_RESIDUAL_RAW)) {
+            console.log('🔄 Rebalancing (single-sided A): Selling ALL USDT for USDC');
+            const swapTx = await getJupiterSwapTx(MINT_B, MINT_A, usdtBal.toString());
+            if (swapTx) { await sendAndConfirm(swapTx, "Jupiter Rebalance Swap"); await new Promise(r => setTimeout(r, 2000)); await raydium.account.fetchWalletTokenAccounts(); }
+        }
+        return;
+    }
+    if (singleSided === 'B') {
+        if (usdcBal.gt(REBALANCE_RESIDUAL_RAW)) {
+            console.log('🔄 Rebalancing (single-sided B): Selling ALL USDC for USDT');
+            const swapTx = await getJupiterSwapTx(MINT_A, MINT_B, usdcBal.toString());
+            if (swapTx) { await sendAndConfirm(swapTx, "Jupiter Rebalance Swap"); await new Promise(r => setTimeout(r, 2000)); await raydium.account.fetchWalletTokenAccounts(); }
+        }
+        return;
+    }
+
+    // ── Two-sided: solve for the target USDC/USDT split from the CLMM ratio R.
+    const totalUsdcVal = new Decimal(usdcBal.toString()).add(new Decimal(usdtBal.toString()).div(price));
+    const targetUsdt = totalUsdcVal.div(R!.add(new Decimal(1).div(price)));
+    const targetUsdc = R!.mul(targetUsdt);
+
     const diffUsdc = new Decimal(usdcBal.toString()).sub(targetUsdc);
     if (diffUsdc.abs().gt(REBALANCE_RESIDUAL_RAW.toString())) {
         console.log(`🔄 Rebalancing: ${diffUsdc.gt(0) ? "Selling USDC for USDT" : "Selling USDT for USDC"}`);
@@ -305,7 +399,7 @@ async function rebalanceToRatio(poolInfo: ApiV3PoolInfoConcentratedItem, tickLow
     }
 }
 
-async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolKeys: any, tickLower: number, tickUpper: number, isNew: boolean, position?: any, preFetchedPoolData?: { poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any }): Promise<any | null> {
+async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolKeys: any, tickLower: number, tickUpper: number, isNew: boolean, position?: any, preFetchedPoolData?: { poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any }, baseDepositPctOverride?: number): Promise<any | null> {
     // Use pre-fetched pool data if caller already has fresh state (e.g. post-withdrawal),
     // otherwise re-fetch to avoid stale sqrtPriceX64 causing 6021 PriceSlippageCheck.
     let poolInfo: ApiV3PoolInfoConcentratedItem;
@@ -324,7 +418,7 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
     const usdtBal = await getTokenBalance(MINT_B);
     if (usdcBal.add(usdtBal).lt(new BN(100_000))) return;
 
-    const { R } = await getRatioMath(poolInfo, tickLower, tickUpper);
+    const { R, singleSided } = await getRatioMath(poolInfo, tickLower, tickUpper);
 
     // Final safety guard: if RPC lag made mainLoop miss an existing active
     // position, do not mint a second NFT. Switch open -> top-up instead.
@@ -346,8 +440,10 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
     }
 
     // Always use the DOMINANT token (higher target %) as base.
-    //   R = USDC/USDT.  R ≥ 1 → USDC dominant → useUsdcAsBase.
-    //                   R < 1 → USDT dominant → useUsdtAsBase.
+    //   singleSided 'A' → 100% USDC → USDC base.
+    //   singleSided 'B' → 100% USDT → USDT base.
+    //   two-sided: R = USDC/USDT.  R ≥ 1 → USDC dominant → useUsdcAsBase.
+    //                              R < 1 → USDT dominant → useUsdtAsBase.
     //
     // Why dominant-as-base avoids 6021:
     //   required_other = base × R_onchain.  "other" is the MINOR token
@@ -359,14 +455,18 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
     //   downward drift in R (price drifting toward upper tick, the likely
     //   direction when R is already small) pushes required_other above the
     //   full USDT balance → 6021.
-    const useUsdcAsBase = R.gte(1);
+    const useUsdcAsBase = singleSided === 'A' ? true
+        : singleSided === 'B' ? false
+        : R!.gte(1);
     const rawBase  = useUsdcAsBase ? usdcBal : usdtBal;
     const rawOther = useUsdcAsBase ? usdtBal : usdcBal;
 
-    const baseAmount  = rawBase.mul(new BN(BASE_DEPOSIT_PCT)).div(new BN(100));
+    const basePct = Math.min(100, Math.max(1, baseDepositPctOverride ?? BASE_DEPOSIT_PCT));
+    const baseAmount  = rawBase.mul(new BN(basePct)).div(new BN(100));
     const otherAmount = rawOther; // full balance — never a binding constraint
 
-    console.log(`🚀 ${effectiveIsNew ? "Opening" : "Top-up"} via ${useUsdcAsBase ? "USDC" : "USDT"} (Ratio: ${R.toFixed(4)})`);
+    const ratioLabel = singleSided ? `single-sided ${singleSided}` : R!.toFixed(4);
+    console.log(`🚀 ${effectiveIsNew ? "Opening" : "Top-up"} via ${useUsdcAsBase ? "USDC" : "USDT"} (Ratio: ${ratioLabel})`);
     let res;
     if (effectiveIsNew) res = await raydium.clmm.openPositionFromBase({ poolInfo, poolKeys, tickLower, tickUpper, baseAmount, otherAmountMax: otherAmount, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, withMetadata: 'no-create', computeBudgetConfig: COMPUTE_BUDGET_CONFIG, txVersion: TxVersion.LEGACY });
     // @ts-ignore
@@ -435,7 +535,28 @@ async function sweepDust(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any,
         if (!pos) { console.log("⚠️ sweepDust: no active position found after extended wait, skipping."); return; }
         // Clear hint after first round so subsequent rounds re-verify on-chain.
         knownPosition = undefined;
-        await depositLiquidity(freshRaw.poolInfo, freshRaw.poolKeys, tickLower, tickUpper, false, pos, { poolInfo: freshRaw.poolInfo, poolKeys: freshRaw.poolKeys });
+        try {
+            await depositLiquidity(freshRaw.poolInfo, freshRaw.poolKeys, tickLower, tickUpper, false, pos, { poolInfo: freshRaw.poolInfo, poolKeys: freshRaw.poolKeys });
+        } catch (e: any) {
+            // A top-up can reject (e.g. Custom 6017) when the wallet's two-token
+            // mix doesn't quite match what the position needs at deposit time —
+            // even after rebalanceToRatio judged the wallet "close enough". Rather
+            // than burn a whole loop (and another failed-tx fee) per attempt as the
+            // logs showed, immediately re-fetch fresh pool state, force a rebalance,
+            // and retry the deposit ONCE with a wider slippage cushion (90% base).
+            console.warn(`⚠️ Sweep deposit failed (${e.message}); re-fetching + rebalancing and retrying with a wider cushion...`);
+            const retryRaw = await raydium.clmm.getPoolInfoFromRpc(POOL_ID.toBase58());
+            await rebalanceToRatio(retryRaw.poolInfo, tickLower, tickUpper);
+            await new Promise(r => setTimeout(r, 1500));
+            const retryPos = pos ?? await getActivePoolPosition(10, 2000);
+            if (!retryPos) { console.log("⚠️ sweepDust retry: no active position; leaving dust for next loop."); return; }
+            try {
+                await depositLiquidity(retryRaw.poolInfo, retryRaw.poolKeys, tickLower, tickUpper, false, retryPos, { poolInfo: retryRaw.poolInfo, poolKeys: retryRaw.poolKeys }, 90);
+            } catch (e2: any) {
+                console.warn(`⚠️ Sweep retry also failed (${e2.message}); leaving dust for next loop.`);
+                return;
+            }
+        }
     }
 }
 
@@ -607,7 +728,43 @@ async function mainLoop() {
             // the price is still earning fees inside the range.
             const outOfRange = tickCurrent < myPosition.tickLower || tickCurrent >= myPosition.tickUpper;
             if (outOfRange) {
-                console.log(`🔁 Out of range (tick ${tickCurrent} not in [${myPosition.tickLower}, ${myPosition.tickUpper})), re-ranging...`);
+                const now = Date.now();
+                // How many ticks the price has run PAST the nearest band edge. 1 =
+                // just stepped out (likely a wiggle); large = a genuine move.
+                const ticksPast = tickCurrent < myPosition.tickLower
+                    ? myPosition.tickLower - tickCurrent
+                    : tickCurrent - (myPosition.tickUpper - 1);
+
+                // ── Volatility circuit-breaker ───────────────────────────────────
+                // While tripped we HOLD the position and do not swap at all — the
+                // whole point is to stop round-tripping the position into a moving
+                // price. Overrides the far-tick early-exit on purpose.
+                if (now < circuitBreakerUntil) {
+                    const minsLeft = ((circuitBreakerUntil - now) / 60_000).toFixed(1);
+                    console.warn(`🧯 Circuit breaker ACTIVE (${minsLeft} min left): holding position, NOT re-ranging despite tick ${tickCurrent} (${ticksPast} past band). Caps swap bleed during volatility.`);
+                    return;
+                }
+
+                // ── Cooldown (with far-move early-exit) ──────────────────────────
+                const sinceLast = now - lastRerangeAt;
+                if (lastRerangeAt > 0 && sinceLast < RERANGE_COOLDOWN_MS && ticksPast < RERANGE_FAR_TICKS) {
+                    const minsLeft = ((RERANGE_COOLDOWN_MS - sinceLast) / 60_000).toFixed(1);
+                    console.log(`⏳ Re-range cooldown: ${minsLeft} min left and price only ${ticksPast} tick(s) past band (< ${RERANGE_FAR_TICKS}); holding to avoid thrash.`);
+                    return;
+                }
+
+                // ── Trip the breaker if we're re-ranging too often ───────────────
+                // Prune the rolling log to the burst window, then decide.
+                while (rerangeTimestamps.length && rerangeTimestamps[0] < now - RERANGE_BURST_WINDOW_MS) {
+                    rerangeTimestamps.shift();
+                }
+                if (rerangeTimestamps.length >= RERANGE_BURST_LIMIT) {
+                    circuitBreakerUntil = now + RERANGE_CIRCUIT_PAUSE_MS;
+                    console.warn(`🧯 CIRCUIT BREAKER TRIPPED: ${rerangeTimestamps.length} re-ranges within ${(RERANGE_BURST_WINDOW_MS / 60_000).toFixed(0)} min. Pausing re-ranges for ${(RERANGE_CIRCUIT_PAUSE_MS / 60_000).toFixed(0)} min — holding position to stop swapping into a moving price.`);
+                    return;
+                }
+
+                console.log(`🔁 Out of range (tick ${tickCurrent} not in [${myPosition.tickLower}, ${myPosition.tickUpper}), ${ticksPast} past edge), re-ranging...`);
                 // Clear the open-guard timestamp: we are about to close this
                 // position and open a fresh one, so the guard must not block it.
                 lastConfirmedOpenAt = 0;
@@ -621,6 +778,10 @@ async function mainLoop() {
                 await rebalanceToRatio(updatedInfo, newTickLower, newTickUpper);
                 const openedPosition = await depositLiquidity(updatedInfo, updated.poolKeys, newTickLower, newTickUpper, true, undefined, { poolInfo: updatedInfo, poolKeys: updated.poolKeys });
                 await sweepDust(updatedInfo, updated.poolKeys, newTickLower, newTickUpper, openedPosition ?? undefined);
+
+                // Record the completed re-range AFTER it lands, for cooldown + burst tracking.
+                lastRerangeAt = Date.now();
+                rerangeTimestamps.push(lastRerangeAt);
             } else {
                 const usdc = await getTokenBalance(MINT_A);
                 const usdt = await getTokenBalance(MINT_B);
@@ -645,6 +806,12 @@ async function startBot() {
         `rebalance>$${REBALANCE_RESIDUAL_USD} | ` +
         `minSOL=${(MIN_SOL_LAMPORTS / 1e9).toFixed(4)} | ` +
         `priorityFee=${PRIORITY_FEE_MICRO_LAMPORTS}µL/CU × ${COMPUTE_UNIT_LIMIT}CU`
+    );
+    console.log(
+        '🧯 Guards: ' +
+        `jupSlippage=${JUPITER_SLIPPAGE_BPS}bps(fallback ${JUPITER_SLIPPAGE_FALLBACK_BPS}) | ` +
+        `cooldown=${(RERANGE_COOLDOWN_MS / 60_000).toFixed(0)}min (farExit≥${RERANGE_FAR_TICKS} ticks) | ` +
+        `breaker=${RERANGE_BURST_LIMIT} re-ranges/${(RERANGE_BURST_WINDOW_MS / 60_000).toFixed(0)}min → pause ${(RERANGE_CIRCUIT_PAUSE_MS / 60_000).toFixed(0)}min`
     );
     while (true) {
         const loopStart = Date.now();
