@@ -90,6 +90,15 @@ const RERANGE_FAR_TICKS = Number(process.env.RERANGE_FAR_TICKS ?? 3);
 const RERANGE_BURST_LIMIT = Number(process.env.RERANGE_BURST_LIMIT ?? 3);
 const RERANGE_BURST_WINDOW_MS = Number(process.env.RERANGE_BURST_WINDOW_MS ?? 15 * 60_000);
 const RERANGE_CIRCUIT_PAUSE_MS = Number(process.env.RERANGE_CIRCUIT_PAUSE_MS ?? 60 * 60_000);
+// ── Trailing (lazy) re-range ──────────────────────────────────────────────────
+// When TRUE, a re-range does NOT re-centre the band on the new price (which would
+// force a ~50/50 rebalance swap and crystallise IL). Instead it TRAILS the price:
+// the new band is positioned so the current price sits at the edge it just exited
+// toward. That edge needs ~100% of the coin we are ALREADY holding, so the
+// rebalance swap is ~zero — no IL materialised. The band then sells our inventory
+// back as the price reverts (the common case for a stable pair), collecting fees.
+// Set FALSE to restore the old centred behaviour.
+const RERANGE_TRAILING = (process.env.RERANGE_TRAILING ?? 'true').toLowerCase() !== 'false';
 
 Decimal.set({ precision: 80, rounding: Decimal.ROUND_HALF_UP });
 
@@ -118,7 +127,7 @@ let circuitBreakerUntil = 0;
 async function getHotWalletSigner(privateKeyB58: string) {
     const keypair = Keypair.fromSecretKey(bs58.decode(privateKeyB58));
     const publicKey = keypair.publicKey;
-    console.log(`🔑 Hot wallet mode: ${publicKey.toBase58()}`);
+    console.log(` Hot wallet mode: ${publicKey.toBase58()}`);
     return {
         publicKey,
         signTransaction: async (tx: Transaction | VersionedTransaction) => {
@@ -139,11 +148,11 @@ async function getLedgerSigner() {
     const addrStr = Buffer.isBuffer(address) ? bs58.encode(address) : address;
     if (TARGET_WALLET && addrStr !== TARGET_WALLET) throw new Error("Wallet mismatch");
     const publicKey = new PublicKey(addrStr);
-    console.log(`🔐 Ledger mode: ${publicKey.toBase58()}`);
+    console.log(` Ledger mode: ${publicKey.toBase58()}`);
     return {
         publicKey,
         signTransaction: async (tx: Transaction | VersionedTransaction) => {
-            console.log("\n📲 Please confirm on Ledger...");
+            console.log("\n Please confirm on Ledger...");
             const message = tx instanceof Transaction ? tx.serializeMessage() : tx.message.serialize();
             const { signature } = await solanaApp.signTransaction(LEDGER_PATH, Buffer.from(message));
             tx.addSignature(publicKey, signature);
@@ -176,7 +185,7 @@ async function initRaydium() {
     await preflightNetworkCheck();
 
     // Idempotent ATA creation for USDC and USDT to avoid dynamic rent overhead
-    console.log('🔧 Ensuring token accounts exist...');
+    console.log(' Ensuring token accounts exist...');
     const ataInstructions = [
         createAssociatedTokenAccountIdempotentInstruction(walletAddress, getAssociatedTokenAddressSync(MINT_A, walletAddress, true), walletAddress, MINT_A),
         createAssociatedTokenAccountIdempotentInstruction(walletAddress, getAssociatedTokenAddressSync(MINT_B, walletAddress, true), walletAddress, MINT_B)
@@ -284,14 +293,14 @@ async function sendAndConfirm(tx: Transaction | VersionedTransaction, label: str
         const endBal = await connection.getBalance(walletAddress, 'finalized');
         diff = (startBal - endBal) / 1e9;
     }
-    console.log(`💸 [${label}] Net SOL Change: ${diff.toFixed(6)} SOL`);
+    console.log(` [${label}] Net SOL Change: ${diff.toFixed(6)} SOL`);
     return signature;
 }
 
 // ====================== CORE ACTIONS ======================
 
 async function safeWithdrawAll(position: any) {
-    console.log(`\n🛡️ CONSOLIDATED WITHDRAWAL...`);
+    console.log(`\n️ CONSOLIDATED WITHDRAWAL...`);
     const poolInfoRaw = await raydium.clmm.getPoolInfoFromRpc(position.poolId.toBase58());
     
     if (poolInfoRaw.poolKeys.rewardInfos && poolInfoRaw.poolKeys.rewardInfos.length > 0) {
@@ -371,7 +380,7 @@ async function rebalanceToRatio(poolInfo: ApiV3PoolInfoConcentratedItem, tickLow
     // ── Single-sided: target is 100% of one token, so sell the entire other side.
     if (singleSided === 'A') {
         if (usdtBal.gt(REBALANCE_RESIDUAL_RAW)) {
-            console.log('🔄 Rebalancing (single-sided A): Selling ALL USDT for USDC');
+            console.log(' Rebalancing (single-sided A): Selling ALL USDT for USDC');
             const swapTx = await getJupiterSwapTx(MINT_B, MINT_A, usdtBal.toString());
             if (swapTx) { await sendAndConfirm(swapTx, "Jupiter Rebalance Swap"); await new Promise(r => setTimeout(r, 2000)); await raydium.account.fetchWalletTokenAccounts(); }
         }
@@ -379,7 +388,7 @@ async function rebalanceToRatio(poolInfo: ApiV3PoolInfoConcentratedItem, tickLow
     }
     if (singleSided === 'B') {
         if (usdcBal.gt(REBALANCE_RESIDUAL_RAW)) {
-            console.log('🔄 Rebalancing (single-sided B): Selling ALL USDC for USDT');
+            console.log(' Rebalancing (single-sided B): Selling ALL USDC for USDT');
             const swapTx = await getJupiterSwapTx(MINT_A, MINT_B, usdcBal.toString());
             if (swapTx) { await sendAndConfirm(swapTx, "Jupiter Rebalance Swap"); await new Promise(r => setTimeout(r, 2000)); await raydium.account.fetchWalletTokenAccounts(); }
         }
@@ -393,7 +402,7 @@ async function rebalanceToRatio(poolInfo: ApiV3PoolInfoConcentratedItem, tickLow
 
     const diffUsdc = new Decimal(usdcBal.toString()).sub(targetUsdc);
     if (diffUsdc.abs().gt(REBALANCE_RESIDUAL_RAW.toString())) {
-        console.log(`🔄 Rebalancing: ${diffUsdc.gt(0) ? "Selling USDC for USDT" : "Selling USDT for USDC"}`);
+        console.log(` Rebalancing: ${diffUsdc.gt(0) ? "Selling USDC for USDT" : "Selling USDT for USDC"}`);
         const swapTx = diffUsdc.gt(0) ? await getJupiterSwapTx(MINT_A, MINT_B, diffUsdc.toFixed(0)) : await getJupiterSwapTx(MINT_B, MINT_A, new Decimal(usdtBal.toString()).sub(targetUsdt).toFixed(0));
         if (swapTx) { await sendAndConfirm(swapTx, "Jupiter Rebalance Swap"); await new Promise(r => setTimeout(r, 2000)); await raydium.account.fetchWalletTokenAccounts(); }
     }
@@ -466,7 +475,7 @@ async function depositLiquidity(_poolInfo: ApiV3PoolInfoConcentratedItem, _poolK
     const otherAmount = rawOther; // full balance — never a binding constraint
 
     const ratioLabel = singleSided ? `single-sided ${singleSided}` : R!.toFixed(4);
-    console.log(`🚀 ${effectiveIsNew ? "Opening" : "Top-up"} via ${useUsdcAsBase ? "USDC" : "USDT"} (Ratio: ${ratioLabel})`);
+    console.log(` ${effectiveIsNew ? "Opening" : "Top-up"} via ${useUsdcAsBase ? "USDC" : "USDT"} (Ratio: ${ratioLabel})`);
     let res;
     if (effectiveIsNew) res = await raydium.clmm.openPositionFromBase({ poolInfo, poolKeys, tickLower, tickUpper, baseAmount, otherAmountMax: otherAmount, base: useUsdcAsBase ? 'MintA' : 'MintB', ownerInfo: { useSOLBalance: false }, withMetadata: 'no-create', computeBudgetConfig: COMPUTE_BUDGET_CONFIG, txVersion: TxVersion.LEGACY });
     // @ts-ignore
@@ -517,7 +526,7 @@ async function sweepDust(poolInfo: ApiV3PoolInfoConcentratedItem, poolKeys: any,
             if (round > 0) console.log("✅ Dust cleared.");
             return;
         }
-        console.log(`🧹 Sweep round ${round + 1}: $${(totalDust.toNumber() / 1e6).toFixed(2)} remaining`);
+        console.log(` Sweep round ${round + 1}: $${(totalDust.toNumber() / 1e6).toFixed(2)} remaining`);
 
         // Re-fetch fresh pool state so R is accurate before each round.
         // Without this, a stale R (e.g. R=27.9 with USDT nearly exhausted) causes
@@ -608,7 +617,7 @@ async function reclaimEmptyPositions(poolInfo: ApiV3PoolInfoConcentratedItem, po
     const empties = positions.filter(p => p.poolId.equals(POOL_ID) && p.liquidity.isZero());
     if (empties.length === 0) return;
 
-    console.log(`🧯 Reclaiming ${empties.length} empty position NFT(s) holding locked SOL rent...`);
+    console.log(` Reclaiming ${empties.length} empty position NFT(s) holding locked SOL rent...`);
     for (const pos of empties) {
         try {
             // Mirror safeWithdrawAll's NFT token-program handling so the close
@@ -668,6 +677,29 @@ function computeRange(tickCurrent: number, tickSpacing: number) {
     return { tickLower, tickUpper };
 }
 
+/**
+ * Trailing (lazy) band for a re-range. Positions the band so the current price
+ * sits at the edge it just exited toward, leaving the rest of the band BEHIND the
+ * move:
+ *   - exitUp   → price becomes the TOP tick inside the band   [base-(w-1), base+1)
+ *   - exitDown → price becomes the BOTTOM tick inside the band [base, base+w)
+ * The occupied edge needs ~100% of the coin we already hold after exiting, so the
+ * follow-up rebalance swap is ~zero and no IL is crystallised. The trade-off is
+ * near-zero runway in the trend direction (handled by the cooldown/breaker).
+ */
+function computeTrailingRange(tickCurrent: number, tickSpacing: number, exitUp: boolean) {
+    const base = Math.floor(tickCurrent / tickSpacing) * tickSpacing;
+    const width = POSITION_WIDTH_SPACINGS * tickSpacing;
+    if (exitUp) {
+        const tickUpper = base + tickSpacing; // price = highest tick inside (top)
+        const tickLower = tickUpper - width;
+        return { tickLower, tickUpper };
+    }
+    const tickLower = base;                    // price = lowest tick inside (bottom)
+    const tickUpper = tickLower + width;
+    return { tickLower, tickUpper };
+}
+
 async function mainLoop() {
     try {
         console.log('\n--- Loop ---');
@@ -699,7 +731,7 @@ async function mainLoop() {
             ? (tickCurrent >= myPosition.tickLower && tickCurrent < myPosition.tickUpper)
             : null;
         console.log(
-            `📊 tick ${tickCurrent} | spacing ${tickSpacing} | width ${POSITION_WIDTH_SPACINGS} | target band [${tickLower}, ${tickUpper})` +
+            ` tick ${tickCurrent} | spacing ${tickSpacing} | width ${POSITION_WIDTH_SPACINGS} | target band [${tickLower}, ${tickUpper})` +
             (myPosition ? ` | my band [${myPosition.tickLower}, ${myPosition.tickUpper}) ${inBand ? '✅ in range' : '⚠️ OUT of range'}` : ' | no active position')
         );
 
@@ -741,7 +773,7 @@ async function mainLoop() {
                 // price. Overrides the far-tick early-exit on purpose.
                 if (now < circuitBreakerUntil) {
                     const minsLeft = ((circuitBreakerUntil - now) / 60_000).toFixed(1);
-                    console.warn(`🧯 Circuit breaker ACTIVE (${minsLeft} min left): holding position, NOT re-ranging despite tick ${tickCurrent} (${ticksPast} past band). Caps swap bleed during volatility.`);
+                    console.warn(` Circuit breaker ACTIVE (${minsLeft} min left): holding position, NOT re-ranging despite tick ${tickCurrent} (${ticksPast} past band). Caps swap bleed during volatility.`);
                     return;
                 }
 
@@ -760,11 +792,11 @@ async function mainLoop() {
                 }
                 if (rerangeTimestamps.length >= RERANGE_BURST_LIMIT) {
                     circuitBreakerUntil = now + RERANGE_CIRCUIT_PAUSE_MS;
-                    console.warn(`🧯 CIRCUIT BREAKER TRIPPED: ${rerangeTimestamps.length} re-ranges within ${(RERANGE_BURST_WINDOW_MS / 60_000).toFixed(0)} min. Pausing re-ranges for ${(RERANGE_CIRCUIT_PAUSE_MS / 60_000).toFixed(0)} min — holding position to stop swapping into a moving price.`);
+                    console.warn(` CIRCUIT BREAKER TRIPPED: ${rerangeTimestamps.length} re-ranges within ${(RERANGE_BURST_WINDOW_MS / 60_000).toFixed(0)} min. Pausing re-ranges for ${(RERANGE_CIRCUIT_PAUSE_MS / 60_000).toFixed(0)} min — holding position to stop swapping into a moving price.`);
                     return;
                 }
 
-                console.log(`🔁 Out of range (tick ${tickCurrent} not in [${myPosition.tickLower}, ${myPosition.tickUpper}), ${ticksPast} past edge), re-ranging...`);
+                console.log(` Out of range (tick ${tickCurrent} not in [${myPosition.tickLower}, ${myPosition.tickUpper}), ${ticksPast} past edge), re-ranging...`);
                 // Clear the open-guard timestamp: we are about to close this
                 // position and open a fresh one, so the guard must not block it.
                 lastConfirmedOpenAt = 0;
@@ -774,7 +806,20 @@ async function mainLoop() {
                 // @ts-ignore
                 const newTick = updatedInfo.tickCurrent ?? 0;
                 const newTickSpacing = updatedInfo.config.tickSpacing;
-                const { tickLower: newTickLower, tickUpper: newTickUpper } = computeRange(newTick, newTickSpacing);
+                // Trailing re-range: lay the new band BEHIND the move so the price
+                // sits at the edge it exited toward — that edge wants ~100% of the
+                // coin we're already holding, so the rebalance below is ~zero and we
+                // crystallise no IL. Falls back to centring if the price reverted
+                // back inside the old band before we re-fetched, or if disabled.
+                let newTickLower: number, newTickUpper: number;
+                if (RERANGE_TRAILING && newTick >= myPosition.tickUpper) {
+                    ({ tickLower: newTickLower, tickUpper: newTickUpper } = computeTrailingRange(newTick, newTickSpacing, true));
+                } else if (RERANGE_TRAILING && newTick < myPosition.tickLower) {
+                    ({ tickLower: newTickLower, tickUpper: newTickUpper } = computeTrailingRange(newTick, newTickSpacing, false));
+                } else {
+                    ({ tickLower: newTickLower, tickUpper: newTickUpper } = computeRange(newTick, newTickSpacing));
+                }
+                console.log(`   ↪ ${RERANGE_TRAILING ? 'trailing' : 'centred'} band [${newTickLower}, ${newTickUpper}) for tick ${newTick}`);
                 await rebalanceToRatio(updatedInfo, newTickLower, newTickUpper);
                 const openedPosition = await depositLiquidity(updatedInfo, updated.poolKeys, newTickLower, newTickUpper, true, undefined, { poolInfo: updatedInfo, poolKeys: updated.poolKeys });
                 await sweepDust(updatedInfo, updated.poolKeys, newTickLower, newTickUpper, openedPosition ?? undefined);
@@ -800,6 +845,7 @@ async function startBot() {
     console.log(
         '⚙️ Config: ' +
         `width=${POSITION_WIDTH_SPACINGS} spacing(s) | ` +
+        `rerange=${RERANGE_TRAILING ? 'trailing' : 'centred'} | ` +
         `interval=${(CHECK_INTERVAL_MS / 1000).toFixed(0)}s | ` +
         `baseDeposit=${BASE_DEPOSIT_PCT}% | ` +
         `dust<$${DUST_THRESHOLD_USD} | ` +
@@ -808,7 +854,7 @@ async function startBot() {
         `priorityFee=${PRIORITY_FEE_MICRO_LAMPORTS}µL/CU × ${COMPUTE_UNIT_LIMIT}CU`
     );
     console.log(
-        '🧯 Guards: ' +
+        ' Guards: ' +
         `jupSlippage=${JUPITER_SLIPPAGE_BPS}bps(fallback ${JUPITER_SLIPPAGE_FALLBACK_BPS}) | ` +
         `cooldown=${(RERANGE_COOLDOWN_MS / 60_000).toFixed(0)}min (farExit≥${RERANGE_FAR_TICKS} ticks) | ` +
         `breaker=${RERANGE_BURST_LIMIT} re-ranges/${(RERANGE_BURST_WINDOW_MS / 60_000).toFixed(0)}min → pause ${(RERANGE_CIRCUIT_PAUSE_MS / 60_000).toFixed(0)}min`

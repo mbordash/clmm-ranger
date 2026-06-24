@@ -14,7 +14,7 @@ When the position is already in range and centered, the bot checks for any undep
 
 Designed for stablecoin pairs (e.g. USDC/USDT) but works with any Raydium CLMM pool.
 
-### 🧯 Storm Protection
+###  Storm Protection
 
 During a volatile/depeg episode the price can whipsaw across your band many times in minutes. Without guards, the bot would close + Jupiter-swap + reopen the **whole** position on every crossing — bleeding slippage on each round-trip. Three guards cap that:
 
@@ -23,6 +23,10 @@ During a volatile/depeg episode the price can whipsaw across your band many time
 3. **Tighter Jupiter slippage** — normal rebalance swaps quote at `JUPITER_SLIPPAGE_BPS` (default 5 bps) so a high-impact route is refused rather than filled, with a one-shot widen to `JUPITER_SLIPPAGE_FALLBACK_BPS` only if the tight quote can't route.
 
 Single-sided opens (price at/outside the band) are also handled explicitly rather than via an infinity ratio sentinel, which removes a class of `6047/6017` open failures.
+
+### Trailing (lazy) re-range — minimising IL
+
+When `RERANGE_TRAILING=true` (default), a re-range does **not** re-centre the band on the new price. Re-centring would force a ~50/50 rebalance swap, and *that swap is the moment impermanent loss gets crystallised* (you sell the coin you're now over-weight in, at the bad price). Instead the bot **trails** the price: the new band is laid down so the current price sits at the **edge it just exited toward**. That edge needs ~100% of the coin you're already holding, so the rebalance swap is **~zero** and no IL is materialised — the band then sells your inventory back as the price reverts (the common case for a stable pair), collecting fees. The trade-off is little runway in the trend direction, which the cooldown/circuit-breaker already throttle. Set `RERANGE_TRAILING=false` to restore the old centred behaviour.
 
 ## Requirements
 
@@ -56,6 +60,7 @@ Edit `.env` with your values:
 | `RERANGE_FAR_TICKS` | Ticks past the band edge that override the cooldown — a genuine move worth following (default `3`) |
 | `RERANGE_BURST_LIMIT` / `RERANGE_BURST_WINDOW_MS` | Circuit breaker: this many re-ranges within this window trips a pause (defaults `3` / `900000` = 15 min) |
 | `RERANGE_CIRCUIT_PAUSE_MS` | How long the circuit breaker holds the position without re-ranging (default `3600000` = 60 min) |
+| `RERANGE_TRAILING` | `true` (default) = trailing/lazy re-range (band laid behind the move, ~zero rebalance swap, no IL crystallised); `false` = old centred 50/50 behaviour |
 | `DUST_THRESHOLD_USD` | Min leftover wallet value (USD) worth re-depositing; below this the bot stops sweeping (default `50`) |
 | `BASE_DEPOSIT_PCT` | Percent of the dominant token deposited per round; the rest is a slippage cushion vs error 6021. Higher = more capital deployed (default `95`; try `99` for stable 1-tick pairs) |
 | `REBALANCE_RESIDUAL_USD` | Min wallet imbalance (USD) before firing a Jupiter rebalance swap; below this is "close enough" (default `1.0`) |
