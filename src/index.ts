@@ -20,8 +20,8 @@ const ACTUAL_PROGRAM_ID = new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrK
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS ?? 120_000);
 // Minimum wallet SOL (lamports) required to safely start a re-range. Below this
 // the loop skips mutating actions so we never get stuck with a half-open
-// position after running out of gas mid-cycle. Default 0.035 SOL.
-const MIN_SOL_LAMPORTS = Number(process.env.MIN_SOL_LAMPORTS ?? 35_000_000);
+// position after running out of gas mid-cycle. Default 0.0100 SOL.
+const MIN_SOL_LAMPORTS = Number(process.env.MIN_SOL_LAMPORTS ?? 10_000_000);
 const TARGET_WALLET = process.env.WALLET_ADDRESS;   // optional in hot-wallet mode
 const LEDGER_PATH = process.env.LEDGER_PATH ?? "44'/501'";
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY; // base58 private key — set to use hot wallet instead of Ledger
